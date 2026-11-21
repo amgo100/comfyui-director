@@ -45,7 +45,9 @@ def _err(e, status=400):
 
 def _full(pid, extra=None):
     proj = P.load(pid)
-    d = {"project": proj, "status": P.status(proj), "finish": P.finish_status(proj, load_config())}
+    cfg = load_config()
+    d = {"project": proj, "status": P.status(proj, M.effective_config(cfg, proj["settings"])),
+         "finish": P.finish_status(proj, cfg)}
     if extra:
         d.update(extra)
     return d
@@ -95,8 +97,9 @@ def register(routes):
             body = await request.json()
             ops = body if isinstance(body, list) else [body]
             res = {}
+            cfg = load_config()
             for o in ops:
-                res = P.apply_op(pid, o)
+                res = P.apply_op(pid, o, M.effective_config(cfg, P.load(pid)["settings"]))
             res.pop("project", None)
             return web.json_response(_full(pid, {"result": res}))
         except Exception as e:
@@ -119,8 +122,17 @@ def register(routes):
 
     @routes.get("/director/project/{pid}/plan")
     async def plan(request):
+        """Next auto-fill step: one model group (see graphs.plan_step). ?stale=1 includes stale takes,
+        ?loaded=<model key> is what the last finished job had loaded."""
         pid = request.match_info["pid"]
-        return _ok(jobs=P.plan(P.load(pid)))
+        try:
+            q = request.rel_url.query
+            return _ok(**graphs.plan_step(load_config(), P.load(pid), stale=q.get("stale") == "1",
+                                          loaded=q.get("loaded", ""),
+                                          skip=set(filter(None, q.get("skip", "").split(",")))))
+        except Exception as e:
+            traceback.print_exc()
+            return _err(e)
 
     @routes.post("/director/project/{pid}/upload")
     async def upload(request):

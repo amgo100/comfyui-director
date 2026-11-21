@@ -697,10 +697,80 @@ def build(cfg, proj, req):
             count = 1
         else:
             raise ValueError(f"unknown action {action}")
+        if action in ("keyframe.generate", "segment.generate"):
+            kind = action.split(".")[0]
+            ent = kf if kind == "keyframe" else seg
+            _annotate(g, inputs=P.dependencies(proj, kind, ent, cfg), select=bool(req.get("select")) or None)
+        elif action in ("keyframe.inpaint", "segment.inpaint"):
+            ents = proj["keyframes"][req["id"]] if action == "keyframe.inpaint" else seg
+            parent = next((t for t in ents["takes"] if t["id"] == req["take"]), {})
+            if "inputs" in parent:  # an inpainted take is still made from its parent's inputs
+                _annotate(g, inputs=parent["inputs"])
         jobs.append({"prompt": g, "target": target, "seed": seed})
         if action == "render.interpolate":
             break
     return jobs
+
+
+def _annotate(g, **fields):
+    """Adds fields to the take metadata of a graph's save node(s)."""
+    fields = {k: v for k, v in fields.items() if v is not None}
+    for n in g.values():
+        if n["class_type"] in ("DirectorSaveImage", "DirectorSaveVideo") and \
+                n["inputs"].get("target", "").split(":")[0] in ("keyframe", "segment"):
+            meta = json.loads(n["inputs"].get("meta") or "{}")
+            meta.update(fields)
+            n["inputs"]["meta"] = json.dumps(meta, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- model-grouped planning
+#
+# Switching between Qwen and the various Wan models costs a full reload (tens of seconds to minutes
+# for 14B weights), while consecutive graphs with identical loader nodes reuse the loaded model from
+# ComfyUI's cache. Auto-fill therefore queues one model group per step: the group whose weights are
+# already loaded if it has work, otherwise keyframes (they unlock clips), otherwise the biggest group.
+# Work that becomes ready meanwhile accumulates and is picked up by a later step of the same group.
+
+MODEL_LOADERS = {"UNETLoader": "unet_name", "UnetLoaderGGUF": "unet_name", "CheckpointLoaderSimple": "ckpt_name"}
+MODE_LABEL = {"i2v": "image→video", "flf2v": "first/last frame", "inp": "Fun InP", "t2v": "text→video", "vace": "VACE",
+              "camera": "Fun Camera", "control": "Fun Control"}
+
+
+def model_key(graph):
+    """The diffusion weights a graph loads (same rule as the panel's modelKey())."""
+    return "|".join(sorted({n["inputs"][MODEL_LOADERS[n["class_type"]]] for n in graph.values()
+                            if n["class_type"] in MODEL_LOADERS}))
+
+
+def plan_step(cfg, proj, stale=False, loaded="", skip=()):
+    """Next auto-fill step: {jobs (one model group), groups: [{key, label, count}], total}.
+    skip: ids already tried in this auto-fill run. A regenerated stale take is not regenerated again
+    (no loops), and a job that failed is not retried over and over."""
+    cfg_eff = M.effective_config(cfg, proj["settings"])
+    groups = {}
+    for job in P.plan(proj, cfg_eff, stale=stale):
+        if job["id"] in skip:
+            continue
+        try:
+            g = build(cfg, proj, dict(job, count=1))[0]["prompt"]
+        except Exception as e:  # not buildable after all (e.g. a missing file): leave it for a manual run
+            job["error"] = str(e)
+            continue
+        key = model_key(g)
+        kind = job["action"].split(".")[0]
+        label = ("keyframes" if kind == "keyframe" else MODE_LABEL.get(job.get("mode"), job.get("mode") or "clips"))
+        grp = groups.setdefault(key, {"key": key, "labels": [], "jobs": [], "keyframes": False})
+        grp["jobs"].append(dict(job, models=key))
+        grp["keyframes"] |= kind == "keyframe"
+        if label not in grp["labels"]:
+            grp["labels"].append(label)
+    if not groups:
+        return {"jobs": [], "groups": [], "total": 0}
+    order = list(groups.values())
+    pick = groups.get(loaded) or next((x for x in order if x["keyframes"]), None) or max(order, key=lambda x: len(x["jobs"]))
+    summary = [{"key": x["key"], "label": " / ".join(x["labels"]), "count": len(x["jobs"])} for x in order]
+    return {"jobs": pick["jobs"], "group": " / ".join(pick["labels"]), "groups": summary,
+            "total": sum(len(x["jobs"]) for x in order)}
 
 
 def build_finish(cfg, proj, req):

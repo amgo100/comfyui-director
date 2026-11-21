@@ -19,7 +19,12 @@ Segment
   end   : {type: none | keyframe | next, keyframe}
   mode  : auto | i2v | flf2v | t2v | vace
   context_frames: frames of neighbouring clips given to VACE (motion continuity)
-  takes : [{id, file, first, last, frames, first_is_anchor, last_is_anchor, finished, ...}]
+  takes : [{id, file, first, last, frames, first_is_anchor, last_is_anchor, inputs, finished, ...}]
+
+Stale tracking
+  Every generated take records `inputs`: the selected take of each keyframe / clip it was made from
+  ({"kf:<id>": take id, "seg:<id>": take id}). When one of those selections changes (a keyframe is
+  regenerated, a previous clip gets a new take, an anchor is swapped), the take is *stale*.
 
 Finishing
   A take can carry a `finished` version: the same frames upscaled to the delivery size (optionally
@@ -128,7 +133,7 @@ def create_project(name: str) -> dict:
     d = project_dir(pid)
     for s in SUBDIRS:
         os.makedirs(os.path.join(d, s), exist_ok=True)
-    proj = {"id": pid, "name": name, "version": 1, "created": time.time(), "updated": time.time(),
+    proj = {"id": pid, "name": name, "version": 2, "created": time.time(), "updated": time.time(),
             "settings": copy.deepcopy(DEFAULT_SETTINGS), "keyframes": {}, "timeline": []}
     save(proj)
     return proj
@@ -141,7 +146,25 @@ def load(pid: str) -> dict:
     s = copy.deepcopy(DEFAULT_SETTINGS)
     s.update(proj.get("settings", {}))
     proj["settings"] = s
+    if int(proj.get("version", 1)) < 2:
+        _migrate_v2(proj)
     return proj
+
+
+def _migrate_v2(proj):
+    """Projects from before stale tracking: assume the currently selected takes are consistent with
+    each other and record their inputs, so later changes are detected."""
+    with _LOCK:
+        for kf in proj["keyframes"].values():
+            t = selected_take(kf)
+            if t and "inputs" not in t and t.get("op") in GENERATED_OPS:
+                t["inputs"] = dependencies(proj, "keyframe", kf)
+        for seg in proj["timeline"]:
+            t = selected_take(seg)
+            if seg["kind"] == "generate" and t and "inputs" not in t and t.get("op") in GENERATED_OPS:
+                t["inputs"] = dependencies(proj, "segment", seg)
+        proj["version"] = 2
+        save(proj)
 
 
 def save(proj: dict):
@@ -228,8 +251,9 @@ def add_take(pid: str, target: str, take: dict) -> dict:
             raise ValueError(f"bad target {target!r}")
         take.setdefault("id", new_id("take"))
         take.setdefault("created", time.time())
+        select = take.pop("select", False)  # regenerating a stale take: the new one replaces it
         ent.setdefault("takes", []).append(take)
-        if not ent.get("selected"):
+        if select or not ent.get("selected"):
             ent["selected"] = take["id"]
     return take
 
@@ -242,7 +266,7 @@ SEG_FIELDS = {"name", "kind", "frames", "prompt", "start", "end", "mode", "use_c
 SETTINGS_FIELDS = set(DEFAULT_SETTINGS)
 
 
-def apply_op(pid: str, op: dict) -> dict:
+def apply_op(pid: str, op: dict, cfg=None) -> dict:
     """Fine-grained edits so the UI never overwrites takes written by running jobs."""
     name = op.get("op")
     with edit(pid) as proj:
@@ -321,6 +345,13 @@ def apply_op(pid: str, op: dict) -> dict:
         elif name in ("keyframe.select", "segment.select"):
             ent = proj["keyframes"][op["id"]] if name.startswith("keyframe") else find_segment(proj, op["id"])[1]
             ent["selected"] = op["take"]
+        elif name in ("keyframe.keep", "segment.keep"):
+            # stale, but good enough: record the current inputs as the ones the selected take was made from
+            kind = name.split(".")[0]
+            ent = proj["keyframes"][op["id"]] if kind == "keyframe" else find_segment(proj, op["id"])[1]
+            t = selected_take(ent)
+            if t:
+                t["inputs"] = dependencies(proj, kind, ent, cfg)
         elif name in ("keyframe.delete_take", "segment.delete_take"):
             ent = proj["keyframes"][op["id"]] if name.startswith("keyframe") else find_segment(proj, op["id"])[1]
             ent["takes"] = [t for t in ent["takes"] if t["id"] != op["take"]]
@@ -506,6 +537,101 @@ def keyframe_size(settings):
     return int(round(kw / 32) * 32), int(round(kh / 32) * 32)
 
 
+# -------------------------------------------------------------------- stale tracking
+
+GENERATED_OPS = {"t2i", "edit", "inpaint", "generate"}
+
+
+def image_model(proj, cfg=None):
+    return proj["settings"].get("image_model") or (cfg or {}).get("image_model") or "qwen21"
+
+
+def dependencies(proj, kind, ent, cfg=None):
+    """{"kf:<id>" | "seg:<id>": selected take id (or None)} for everything a generation of this
+    keyframe / clip reads. Mirrors what the graph builders use."""
+    deps = {}
+
+    def kf(k):
+        t = selected_take(proj["keyframes"].get(k) or {})
+        deps[f"kf:{k}"] = t["id"] if t else None
+
+    def seg(sg):
+        if sg["kind"] == "still":
+            if sg.get("keyframe"):
+                kf(sg["keyframe"])
+        else:
+            t = selected_take(sg)
+            deps[f"seg:{sg['id']}"] = t["id"] if t else None
+
+    if kind == "keyframe":
+        rec = ent.get("recipe", {})
+        if rec.get("op") not in ("t2i", "edit"):
+            return {}
+        parents = [p for p in rec.get("parents", []) if p and p != ent["id"]]
+        for p in parents:
+            kf(p)
+        if image_model(proj, cfg) == "qwen21":
+            for r in proj["settings"].get("image_reference_keyframes") or []:
+                if r != ent["id"] and r not in parents and selected_take(proj["keyframes"].get(r) or {}):
+                    kf(r)
+        return deps
+
+    if ent.get("kind") != "generate":
+        return {}
+    tl = proj["timeline"]
+    idx = next((i for i, x in enumerate(tl) if x["id"] == ent["id"]), None)
+    if idx is None:
+        return {}
+    st, en = ent["start"], ent["end"]
+    motion = ent.get("motion") or {}
+    if st["type"] == "keyframe" and st.get("keyframe"):
+        kf(st["keyframe"])
+    elif st["type"] == "prev" and idx > 0:
+        seg(tl[idx - 1])
+    if motion.get("type", "none") not in ("camera", "control"):
+        if en["type"] == "keyframe" and en.get("keyframe"):
+            kf(en["keyframe"])
+        elif en["type"] == "next" and idx + 1 < len(tl):
+            seg(tl[idx + 1])
+    src = (motion.get("source") or {}) if motion.get("type") == "control" else {}
+    if src.get("segment") and src["segment"] != ent["id"]:
+        try:
+            seg(find_segment(proj, src["segment"])[1])
+        except KeyError:
+            pass
+    return deps
+
+
+def _dep_label(proj, ref):
+    kind, _, eid = ref.partition(":")
+    if kind == "kf":
+        k = proj["keyframes"].get(eid)
+        return f"keyframe '{(k or {}).get('name') or eid}'"
+    try:
+        sg = find_segment(proj, eid)[1]
+        return f"clip '{sg.get('name') or eid}'"
+    except KeyError:
+        return f"clip {eid}"
+
+
+def stale_reasons(proj, kind, ent, cfg=None):
+    """Why the selected take no longer matches its inputs ([] = up to date or unknown)."""
+    t = selected_take(ent)
+    if not t or "inputs" not in t:
+        return []
+    old, cur = t["inputs"] or {}, dependencies(proj, kind, ent, cfg)
+    out = []
+    for ref, tid in cur.items():
+        if ref not in old:
+            out.append(f"now uses {_dep_label(proj, ref)}")
+        elif old[ref] != tid:
+            out.append(f"{_dep_label(proj, ref)} has a different take selected")
+    for ref in old:
+        if ref not in cur:
+            out.append(f"no longer uses {_dep_label(proj, ref)}")
+    return out
+
+
 # -------------------------------------------------------------------- planning
 
 def project_refs(proj, exclude=()):
@@ -537,12 +663,13 @@ def keyframe_ready(proj, kf):
     return True, ""
 
 
-def status(proj):
-    """Per-entity readiness for the UI and for auto-fill."""
+def status(proj, cfg=None):
+    """Per-entity readiness, staleness and mode for the UI and for auto-fill."""
     out = {"keyframes": {}, "segments": {}}
     for kid, kf in proj["keyframes"].items():
         ok, why = keyframe_ready(proj, kf)
-        out["keyframes"][kid] = {"ready": ok, "why": why, "has_take": bool(kf.get("takes"))}
+        out["keyframes"][kid] = {"ready": ok, "why": why, "has_take": bool(kf.get("takes")),
+                                 "stale": stale_reasons(proj, "keyframe", kf, cfg)}
     for i, seg in enumerate(proj["timeline"]):
         if seg["kind"] != "generate":
             out["segments"][seg["id"]] = {"ready": False, "why": seg["kind"], "has_take": bool(seg.get("takes"))}
@@ -556,20 +683,44 @@ def status(proj):
                 ok, why = False, "text-to-video needs a prompt"
         except NotReady as e:
             ok, why, mode = False, str(e), None
-        out["segments"][seg["id"]] = {"ready": ok, "why": why, "mode": mode, "has_take": bool(seg.get("takes"))}
+        out["segments"][seg["id"]] = {"ready": ok, "why": why, "mode": mode, "has_take": bool(seg.get("takes")),
+                                      "stale": stale_reasons(proj, "segment", seg, cfg)}
+    _mark_downstream(proj, out, cfg)
     return out
 
 
-def plan(proj):
-    """Everything that can be generated right now and has no takes yet."""
-    st = status(proj)
+def _mark_downstream(proj, st, cfg=None):
+    """`downstream`: not stale itself, but built from something that is (it will be once that is
+    regenerated)."""
+    nodes = {}
+    for kid, kf in proj["keyframes"].items():
+        nodes[f"kf:{kid}"] = (st["keyframes"][kid], dependencies(proj, "keyframe", kf, cfg))
+    for seg in proj["timeline"]:
+        nodes[f"seg:{seg['id']}"] = (st["segments"][seg["id"]], dependencies(proj, "segment", seg, cfg))
+    bad = {k for k, (v, _) in nodes.items() if v.get("stale")}
+    changed = True
+    while changed:
+        changed = False
+        for k, (v, deps) in nodes.items():
+            if k not in bad and v.get("has_take") and any(d in bad for d in deps):
+                bad.add(k)
+                v["downstream"] = True
+                changed = True
+
+
+def plan(proj, cfg=None, stale=False):
+    """Everything that can be generated right now and has no takes yet; with stale=True also every
+    ready keyframe / clip whose selected take is stale (its new take will replace the selection)."""
+    st = status(proj, cfg)
     jobs = []
-    for kid, v in st["keyframes"].items():
-        if v["ready"] and not v["has_take"]:
-            jobs.append({"action": "keyframe.generate", "id": kid})
-    for sid, v in st["segments"].items():
-        if v["ready"] and not v["has_take"]:
-            jobs.append({"action": "segment.generate", "id": sid})
+    for kind, action in (("keyframes", "keyframe.generate"), ("segments", "segment.generate")):
+        for eid, v in st[kind].items():
+            if not v["ready"]:
+                continue
+            if not v["has_take"]:
+                jobs.append({"action": action, "id": eid, "mode": v.get("mode")})
+            elif stale and v.get("stale"):
+                jobs.append({"action": action, "id": eid, "mode": v.get("mode"), "select": True, "stale": True})
     return jobs
 
 
