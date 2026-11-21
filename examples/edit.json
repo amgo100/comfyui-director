@@ -1,0 +1,258 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "qwen_image_edit_2511_bf16.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "UNETLoader"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+   "type": "qwen_image",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "CLIPLoader"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  },
+  "_meta": {
+   "title": "VAELoader"
+  }
+ },
+ "4": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "lora_name": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "lora_name": "film_grain_style.safetensors",
+   "strength_model": 0.6
+  },
+  "_meta": {
+   "title": "LoRA film_grain_style.safetensors"
+  }
+ },
+ "6": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "lora_name": "my_character_qwen.safetensors",
+   "strength_model": 0.9
+  },
+  "_meta": {
+   "title": "LoRA my_character_qwen.safetensors"
+  }
+ },
+ "7": {
+  "class_type": "ModelSamplingAuraFlow",
+  "inputs": {
+   "model": [
+    "6",
+    0
+   ],
+   "shift": 3.1
+  },
+  "_meta": {
+   "title": "ModelSamplingAuraFlow"
+  }
+ },
+ "8": {
+  "class_type": "CFGNorm",
+  "inputs": {
+   "model": [
+    "7",
+    0
+   ],
+   "strength": 1.0
+  },
+  "_meta": {
+   "title": "CFGNorm"
+  }
+ },
+ "9": {
+  "class_type": "DirectorLoadImage",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "keyframes/kf_4a470dfb/take_8564015d.png",
+   "width": 1344,
+   "height": 784,
+   "fit": "cover"
+  },
+  "_meta": {
+   "title": "Source"
+  }
+ },
+ "10": {
+  "class_type": "TextEncodeQwenImageEditPlus",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "prompt": "Same scene, closer: the lighthouse keeper walks up the cliff path holding a lantern",
+   "vae": [
+    "3",
+    0
+   ],
+   "image1": [
+    "9",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Prompt"
+  }
+ },
+ "11": {
+  "class_type": "TextEncodeQwenImageEditPlus",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "prompt": "",
+   "vae": [
+    "3",
+    0
+   ],
+   "image1": [
+    "9",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Negative"
+  }
+ },
+ "12": {
+  "class_type": "FluxKontextMultiReferenceLatentMethod",
+  "inputs": {
+   "conditioning": [
+    "10",
+    0
+   ],
+   "reference_latents_method": "index_timestep_zero"
+  },
+  "_meta": {
+   "title": "FluxKontextMultiReferenceLatentMethod"
+  }
+ },
+ "13": {
+  "class_type": "FluxKontextMultiReferenceLatentMethod",
+  "inputs": {
+   "conditioning": [
+    "11",
+    0
+   ],
+   "reference_latents_method": "index_timestep_zero"
+  },
+  "_meta": {
+   "title": "FluxKontextMultiReferenceLatentMethod"
+  }
+ },
+ "14": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "pixels": [
+    "9",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEEncode"
+  }
+ },
+ "15": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "8",
+    0
+   ],
+   "seed": 108844205231008,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "12",
+    0
+   ],
+   "negative": [
+    "13",
+    0
+   ],
+   "latent_image": [
+    "14",
+    0
+   ],
+   "denoise": 1.0
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "16": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "15",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEDecode"
+  }
+ },
+ "17": {
+  "class_type": "DirectorSaveImage",
+  "inputs": {
+   "images": [
+    "16",
+    0
+   ],
+   "project": "Lighthouse-at-dusk",
+   "target": "keyframe:kf_8056956e",
+   "meta": "{\"op\": \"edit\", \"seed\": 108844205231008, \"prompt\": \"Same scene, closer: the lighthouse keeper walks up the cliff path holding a lantern\", \"source\": \"keyframes/kf_4a470dfb/take_8564015d.png\", \"refs\": [], \"mask\": null, \"loras\": [{\"name\": \"film_grain_style.safetensors\", \"strength\": 0.6}, {\"name\": \"my_character_qwen.safetensors\", \"strength\": 0.9}]}"
+  },
+  "_meta": {
+   "title": "DirectorSaveImage"
+  }
+ }
+}

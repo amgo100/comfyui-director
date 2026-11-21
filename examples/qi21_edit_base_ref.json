@@ -1,0 +1,205 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "UNETLoader"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+   "type": "qwen_image",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "CLIPLoader"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+  },
+  "_meta": {
+   "title": "VAELoader"
+  }
+ },
+ "4": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "lora_name": "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "lora_name": "film_grain_style.safetensors",
+   "strength_model": 0.6
+  },
+  "_meta": {
+   "title": "LoRA film_grain_style.safetensors"
+  }
+ },
+ "6": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "lora_name": "my_character_qwen.safetensors",
+   "strength_model": 0.9
+  },
+  "_meta": {
+   "title": "LoRA my_character_qwen.safetensors"
+  }
+ },
+ "7": {
+  "class_type": "ModelSamplingFlux",
+  "inputs": {
+   "model": [
+    "6",
+    0
+   ],
+   "max_shift": 0.6935,
+   "base_shift": 0.5,
+   "width": 1344,
+   "height": 768
+  },
+  "_meta": {
+   "title": "ModelSamplingFlux"
+  }
+ },
+ "8": {
+  "class_type": "DirectorLoadImage",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "keyframes/kf_4a470dfb/take_8564015d.png",
+   "width": 1344,
+   "height": 768,
+   "fit": "cover"
+  },
+  "_meta": {
+   "title": "Base image (image1)"
+  }
+ },
+ "9": {
+  "class_type": "DirectorLoadImage",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "imports/up_1d2e47e3.png",
+   "width": 0,
+   "height": 0,
+   "fit": "none",
+   "max_megapixels": 1.0
+  },
+  "_meta": {
+   "title": "Reference (image2)"
+  }
+ },
+ "10": {
+  "class_type": "TextEncodeQwenImage21",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "prompt": "Same scene as <image1>, closer: the keeper from <image2> walks up the cliff path holding his lantern, cinematic, 35mm film, warm dusk light, painterly matte",
+   "negative_prompt": "",
+   "vae": [
+    "3",
+    0
+   ],
+   "resolution": 0,
+   "images.image_1": [
+    "8",
+    0
+   ],
+   "images.image_2": [
+    "9",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Prompt"
+  }
+ },
+ "11": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "7",
+    0
+   ],
+   "seed": 49576274358712,
+   "steps": 8,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "10",
+    0
+   ],
+   "negative": [
+    "10",
+    1
+   ],
+   "latent_image": [
+    "10",
+    2
+   ],
+   "denoise": 1.0
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "12": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "11",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEDecode"
+  }
+ },
+ "13": {
+  "class_type": "DirectorSaveImage",
+  "inputs": {
+   "images": [
+    "12",
+    0
+   ],
+   "project": "Lighthouse-at-dusk",
+   "target": "keyframe:kf_8056956e",
+   "meta": "{\"op\": \"edit\", \"model\": \"qwen_image_2.1\", \"seed\": 49576274358712, \"prompt\": \"Same scene as <image1>, closer: the keeper from <image2> walks up the cliff path holding his lantern, cinematic, 35mm film, warm dusk light, painterly matte\", \"source\": \"keyframes/kf_4a470dfb/take_8564015d.png\", \"refs\": [\"imports/up_1d2e47e3.png\"], \"mask\": null, \"loras\": [{\"name\": \"film_grain_style.safetensors\", \"strength\": 0.6}, {\"name\": \"my_character_qwen.safetensors\", \"strength\": 0.9}]}"
+  },
+  "_meta": {
+   "title": "DirectorSaveImage"
+  }
+ }
+}

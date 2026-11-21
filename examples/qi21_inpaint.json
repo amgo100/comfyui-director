@@ -1,0 +1,272 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "qwen_image_2.1_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "UNETLoader"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_8b_int8_convrot.safetensors",
+   "type": "qwen_image",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "CLIPLoader"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_2.1_vae_bf16.safetensors"
+  },
+  "_meta": {
+   "title": "VAELoader"
+  }
+ },
+ "4": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "lora_name": "qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA qwen_image_2.1_turbo_lora_avg_rank_178_bf16.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "lora_name": "film_grain_style.safetensors",
+   "strength_model": 0.6
+  },
+  "_meta": {
+   "title": "LoRA film_grain_style.safetensors"
+  }
+ },
+ "6": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "lora_name": "my_character_qwen.safetensors",
+   "strength_model": 0.9
+  },
+  "_meta": {
+   "title": "LoRA my_character_qwen.safetensors"
+  }
+ },
+ "7": {
+  "class_type": "ModelSamplingFlux",
+  "inputs": {
+   "model": [
+    "6",
+    0
+   ],
+   "max_shift": 0.6935,
+   "base_shift": 0.5,
+   "width": 1344,
+   "height": 768
+  },
+  "_meta": {
+   "title": "ModelSamplingFlux"
+  }
+ },
+ "8": {
+  "class_type": "DirectorLoadImage",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "keyframes/kf_8056956e/take_20188cd5.png",
+   "width": 1344,
+   "height": 768,
+   "fit": "cover"
+  },
+  "_meta": {
+   "title": "Base image (image1)"
+  }
+ },
+ "9": {
+  "class_type": "DirectorLoadMask",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "masks/test.png",
+   "width": 1344,
+   "height": 768
+  },
+  "_meta": {
+   "title": "DirectorLoadMask"
+  }
+ },
+ "10": {
+  "class_type": "DirectorMaskCrop",
+  "inputs": {
+   "image": [
+    "8",
+    0
+   ],
+   "mask": [
+    "9",
+    0
+   ],
+   "padding": 96,
+   "grow": 16,
+   "megapixels": 1.0,
+   "multiple": 32
+  },
+  "_meta": {
+   "title": "DirectorMaskCrop"
+  }
+ },
+ "11": {
+  "class_type": "TextEncodeQwenImage21",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "prompt": "a seagull, cinematic, 35mm film, warm dusk light, painterly matte",
+   "negative_prompt": "",
+   "vae": [
+    "3",
+    0
+   ],
+   "resolution": 0,
+   "images.image_1": [
+    "10",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Prompt"
+  }
+ },
+ "12": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "pixels": [
+    "10",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEEncode"
+  }
+ },
+ "13": {
+  "class_type": "SetLatentNoiseMask",
+  "inputs": {
+   "samples": [
+    "12",
+    0
+   ],
+   "mask": [
+    "10",
+    1
+   ]
+  },
+  "_meta": {
+   "title": "SetLatentNoiseMask"
+  }
+ },
+ "14": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "7",
+    0
+   ],
+   "seed": 83991388340232,
+   "steps": 8,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "11",
+    0
+   ],
+   "negative": [
+    "11",
+    1
+   ],
+   "latent_image": [
+    "13",
+    0
+   ],
+   "denoise": 1.0
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "15": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "14",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEDecode"
+  }
+ },
+ "16": {
+  "class_type": "DirectorMaskStitch",
+  "inputs": {
+   "original": [
+    "8",
+    0
+   ],
+   "patch": [
+    "15",
+    0
+   ],
+   "crop_info": [
+    "10",
+    2
+   ],
+   "feather": 24
+  },
+  "_meta": {
+   "title": "DirectorMaskStitch"
+  }
+ },
+ "17": {
+  "class_type": "DirectorSaveImage",
+  "inputs": {
+   "images": [
+    "16",
+    0
+   ],
+   "project": "Lighthouse-at-dusk",
+   "target": "keyframe:kf_8056956e",
+   "meta": "{\"op\": \"inpaint\", \"model\": \"qwen_image_2.1\", \"seed\": 83991388340232, \"prompt\": \"a seagull, cinematic, 35mm film, warm dusk light, painterly matte\", \"source\": \"keyframes/kf_8056956e/take_20188cd5.png\", \"refs\": [], \"mask\": \"masks/test.png\", \"loras\": [{\"name\": \"film_grain_style.safetensors\", \"strength\": 0.6}, {\"name\": \"my_character_qwen.safetensors\", \"strength\": 0.9}]}"
+  },
+  "_meta": {
+   "title": "DirectorSaveImage"
+  }
+ }
+}

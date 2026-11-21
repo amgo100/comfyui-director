@@ -1,0 +1,171 @@
+{
+ "1": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "qwen_image_2512_fp8_e4m3fn.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "UNETLoader"
+  }
+ },
+ "2": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+   "type": "qwen_image",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "CLIPLoader"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  },
+  "_meta": {
+   "title": "VAELoader"
+  }
+ },
+ "4": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "1",
+    0
+   ],
+   "lora_name": "Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA Qwen-Image-2512-Lightning-4steps-V1.0-fp32.safetensors"
+  }
+ },
+ "5": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "lora_name": "film_grain_style.safetensors",
+   "strength_model": 0.6
+  },
+  "_meta": {
+   "title": "LoRA film_grain_style.safetensors"
+  }
+ },
+ "6": {
+  "class_type": "ModelSamplingAuraFlow",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "shift": 3.1
+  },
+  "_meta": {
+   "title": "ModelSamplingAuraFlow"
+  }
+ },
+ "7": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "text": "Wide night shot, starry sky over the lighthouse, beam visible, cinematic, 35mm film, warm dusk light, painterly matte"
+  },
+  "_meta": {
+   "title": "Prompt"
+  }
+ },
+ "8": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "2",
+    0
+   ],
+   "text": "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲"
+  },
+  "_meta": {
+   "title": "Negative"
+  }
+ },
+ "9": {
+  "class_type": "EmptySD3LatentImage",
+  "inputs": {
+   "width": 1344,
+   "height": 784,
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "EmptySD3LatentImage"
+  }
+ },
+ "10": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "6",
+    0
+   ],
+   "seed": 195408089591668,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "7",
+    0
+   ],
+   "negative": [
+    "8",
+    0
+   ],
+   "latent_image": [
+    "9",
+    0
+   ],
+   "denoise": 1.0
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "11": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "10",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEDecode"
+  }
+ },
+ "12": {
+  "class_type": "DirectorSaveImage",
+  "inputs": {
+   "images": [
+    "11",
+    0
+   ],
+   "project": "Lighthouse-at-dusk",
+   "target": "keyframe:kf_72341c23",
+   "meta": "{\"op\": \"t2i\", \"seed\": 195408089591668, \"prompt\": \"Wide night shot, starry sky over the lighthouse, beam visible, cinematic, 35mm film, warm dusk light, painterly matte\", \"loras\": [{\"name\": \"film_grain_style.safetensors\", \"strength\": 0.6}]}"
+  },
+  "_meta": {
+   "title": "DirectorSaveImage"
+  }
+ }
+}

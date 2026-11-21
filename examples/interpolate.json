@@ -1,0 +1,62 @@
+{
+ "1": {
+  "class_type": "DirectorLoadVideoFrames",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "renders/render_20261120_200721.mp4",
+   "start": 0,
+   "count": -1,
+   "width": 0,
+   "height": 0
+  },
+  "_meta": {
+   "title": "DirectorLoadVideoFrames"
+  }
+ },
+ "2": {
+  "class_type": "FrameInterpolationModelLoader",
+  "inputs": {
+   "model_name": "film_net_fp16.safetensors"
+  },
+  "_meta": {
+   "title": "FrameInterpolationModelLoader"
+  }
+ },
+ "3": {
+  "class_type": "FrameInterpolate",
+  "inputs": {
+   "interp_model": [
+    "2",
+    0
+   ],
+   "images": [
+    "1",
+    0
+   ],
+   "multiplier": 2
+  },
+  "_meta": {
+   "title": "FrameInterpolate"
+  }
+ },
+ "4": {
+  "class_type": "DirectorSaveVideo",
+  "inputs": {
+   "images": [
+    "3",
+    0
+   ],
+   "project": "Lighthouse-at-dusk",
+   "target": "render:interp",
+   "fps": 32,
+   "trim_start": 0,
+   "trim_end": 0,
+   "splice_source": "",
+   "splice_start": 0,
+   "meta": "{\"op\": \"interpolate\", \"source\": \"renders/render_20261120_200721.mp4\"}"
+  },
+  "_meta": {
+   "title": "DirectorSaveVideo"
+  }
+ }
+}

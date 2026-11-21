@@ -1,0 +1,297 @@
+{
+ "1": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+   "type": "wan",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "CLIPLoader"
+  }
+ },
+ "2": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "wan_2.1_vae.safetensors"
+  },
+  "_meta": {
+   "title": "VAELoader"
+  }
+ },
+ "3": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "1",
+    0
+   ],
+   "text": "same shot as a winter night, snow falling, cinematic, smooth camera, film grain"
+  },
+  "_meta": {
+   "title": "Prompt"
+  }
+ },
+ "4": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "1",
+    0
+   ],
+   "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+  },
+  "_meta": {
+   "title": "Negative"
+  }
+ },
+ "5": {
+  "class_type": "DirectorLoadVideoFrames",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "clips/seg_7799e2d9/take_2e289b47.mp4",
+   "start": 0,
+   "count": 81,
+   "width": 832,
+   "height": 480
+  },
+  "_meta": {
+   "title": "Control video"
+  }
+ },
+ "6": {
+  "class_type": "Canny",
+  "inputs": {
+   "image": [
+    "5",
+    0
+   ],
+   "low_threshold": 0.4,
+   "high_threshold": 0.8
+  },
+  "_meta": {
+   "title": "Canny"
+  }
+ },
+ "7": {
+  "class_type": "DirectorLoadImage",
+  "inputs": {
+   "project": "Lighthouse-at-dusk",
+   "path": "keyframes/kf_710e9935/take_60672c9f.png",
+   "width": 832,
+   "height": 480,
+   "fit": "cover"
+  },
+  "_meta": {
+   "title": "Reference (start frame)"
+  }
+ },
+ "8": {
+  "class_type": "Wan22FunControlToVideo",
+  "inputs": {
+   "positive": [
+    "3",
+    0
+   ],
+   "negative": [
+    "4",
+    0
+   ],
+   "vae": [
+    "2",
+    0
+   ],
+   "width": 832,
+   "height": 480,
+   "length": 81,
+   "batch_size": 1,
+   "ref_image": [
+    "7",
+    0
+   ],
+   "control_video": [
+    "6",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Wan22FunControlToVideo"
+  }
+ },
+ "9": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_fun_control_high_noise_14B_fp8_scaled.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Wan control high"
+  }
+ },
+ "10": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "9",
+    0
+   ],
+   "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+  }
+ },
+ "11": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "10",
+    0
+   ],
+   "shift": 5.0
+  },
+  "_meta": {
+   "title": "ModelSamplingSD3"
+  }
+ },
+ "12": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_fun_control_low_noise_14B_fp8_scaled.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Wan control low"
+  }
+ },
+ "13": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "12",
+    0
+   ],
+   "lora_name": "wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA wan2.2_i2v_lightx2v_4steps_lora_v1_low_noise.safetensors"
+  }
+ },
+ "14": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "13",
+    0
+   ],
+   "shift": 5.0
+  },
+  "_meta": {
+   "title": "ModelSamplingSD3"
+  }
+ },
+ "15": {
+  "class_type": "KSamplerAdvanced",
+  "inputs": {
+   "model": [
+    "11",
+    0
+   ],
+   "add_noise": "enable",
+   "noise_seed": 32830655543846,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "8",
+    0
+   ],
+   "negative": [
+    "8",
+    1
+   ],
+   "latent_image": [
+    "8",
+    2
+   ],
+   "start_at_step": 0,
+   "end_at_step": 2,
+   "return_with_leftover_noise": "enable"
+  },
+  "_meta": {
+   "title": "High noise"
+  }
+ },
+ "16": {
+  "class_type": "KSamplerAdvanced",
+  "inputs": {
+   "model": [
+    "14",
+    0
+   ],
+   "add_noise": "disable",
+   "noise_seed": 32830655543846,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "8",
+    0
+   ],
+   "negative": [
+    "8",
+    1
+   ],
+   "latent_image": [
+    "15",
+    0
+   ],
+   "start_at_step": 2,
+   "end_at_step": 10000,
+   "return_with_leftover_noise": "disable"
+  },
+  "_meta": {
+   "title": "Low noise"
+  }
+ },
+ "17": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "16",
+    0
+   ],
+   "vae": [
+    "2",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAEDecode"
+  }
+ },
+ "18": {
+  "class_type": "DirectorSaveVideo",
+  "inputs": {
+   "images": [
+    "17",
+    0
+   ],
+   "project": "Lighthouse-at-dusk",
+   "target": "segment:seg_fc9e06af",
+   "fps": 16,
+   "trim_start": 0,
+   "trim_end": 0,
+   "splice_source": "",
+   "splice_start": 0,
+   "meta": "{\"op\": \"generate\", \"mode\": \"control\", \"seed\": 32830655543846, \"prompt\": \"same shot as a winter night, snow falling, cinematic, smooth camera, film grain\", \"loras\": [], \"first_is_anchor\": false, \"last_is_anchor\": false, \"start_ref\": [\"kf\", \"kf_710e9935\"], \"end_ref\": null}"
+  },
+  "_meta": {
+   "title": "DirectorSaveVideo"
+  }
+ }
+}
