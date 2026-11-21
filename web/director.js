@@ -45,6 +45,9 @@ const S = {
   pending: new Map(),    // prompt_id -> {target, label}
   progress: null, zoom: 3, autofill: false, lastRender: null,
   finish: null,          // finishing status: {settings, items, count}
+  loaded: "",            // diffusion weights of the last finished job (model key), to keep auto-fill on them
+  tried: new Set(),      // ids queued by the current auto-fill run (each is tried once per run)
+  autoFailed: 0,         // jobs of the current auto-fill run that failed
   showFinished: true,    // viewer shows a take's finished (upscaled) version when it has one
 };
 const applyData = (d) => { S.project = d.project; S.status = d.status; if (d.finish) S.finish = d.finish; };
@@ -97,10 +100,18 @@ async function generate(req, label) {
   catch (e) { toast(e.message, true); }
 }
 
+// same rule as graphs.model_key(): the diffusion weights a graph loads
+const MODEL_LOADERS = { UNETLoader: "unet_name", UnetLoaderGGUF: "unet_name", CheckpointLoaderSimple: "ckpt_name" };
+const modelKey = (graph) => [...new Set(Object.values(graph).filter((n) => MODEL_LOADERS[n.class_type])
+  .map((n) => n.inputs[MODEL_LOADERS[n.class_type]]))].sort().join("|");
+
 function onJobDone(pid, ok, msg) {
   if (!S.pending.has(pid)) return;
   const p = S.pending.get(pid);
   S.pending.delete(pid);
+  const key = ok && p.graph ? modelKey(p.graph) : "";
+  if (key) S.loaded = key;
+  if (!ok && p.auto) S.autoFailed++;
   if (!ok) toast(`${p.label} failed: ${msg || "error"}`, true);
   if (S.running === pid) S.running = null;
   if (S.open) loadProject(S.pid).then(() => { render(); if (S.autofill && ![...S.pending.values()].some((x) => x.auto)) autoFillStep(); });
@@ -237,21 +248,41 @@ api.addEventListener("progress_state", (e) => {   // newer ComfyUI: authoritativ
 });
 setInterval(() => { if (S.running) updateProgressUI(); }, 1000);  // keeps elapsed time / ETA ticking
 
-// Auto-fill: generate everything that is ready, wait, repeat (follows dependencies down the timeline)
+// Auto-fill: generate everything that is ready, wait, repeat (follows dependencies down the timeline).
+// Each step queues one model group (the loaded weights first), so models are not swapped back and forth.
+// Mode "gaps" fills items without takes; mode "stale" also regenerates stale takes (new take replaces
+// the selection, which makes whatever was built from it stale in turn: a cascade down the timeline).
+function startAutofill(mode) {
+  S.autofill = mode; S.tried = new Set(); S.autoFailed = 0;
+  render(); autoFillStep();
+}
+function stopAutofill(msg) { S.autofill = false; if (msg) toast(msg); render(); }
 async function autoFillStep() {
   if (!S.autofill) return;
-  const { jobs } = await J(`/director/project/${S.pid}/plan`);
-  const todo = jobs.filter((j) => !pendingFor((j.action.startsWith("keyframe") ? "keyframe:" : "segment:") + j.id));
+  const q = new URLSearchParams({ stale: S.autofill === "stale" ? "1" : "0", loaded: S.loaded, skip: [...S.tried].join(",") });
+  let step;
+  try { step = await J(`/director/project/${S.pid}/plan?${q}`); }
+  catch (e) { stopAutofill(); toast(e.message, true); return; }
+  const todo = step.jobs.filter((j) => !pendingFor((j.action.startsWith("keyframe") ? "keyframe:" : "segment:") + j.id));
   if (!todo.length) {
-    if (!S.pending.size) { S.autofill = false; toast("Auto-fill: nothing left that can be generated"); render(); }
+    if (!S.pending.size) {
+      const what = S.autofill === "stale" ? "Update" : "Auto-fill";
+      stopAutofill(S.autoFailed ? `${what} finished; ${S.autoFailed} job(s) failed and were not retried`
+        : S.autofill === "stale" ? "Everything is up to date" : "Auto-fill: nothing left that can be generated");
+    }
     return;
   }
+  const others = step.groups.filter((g) => g.key !== todo[0].models).reduce((a, g) => a + g.count, 0);
+  toast(`${S.autofill === "stale" ? "Updating" : "Auto-fill"}: ${todo.length} × ${step.group}` + (others ? ` · ${others} more wait for other models` : ""));
+  let queued = 0;
   for (const j of todo) {
     const ent = j.action.startsWith("keyframe") ? kfById(j.id) : segById(j.id);
-    try { await queueAction({ ...j, count: 1 }, `auto: ${ent?.name || j.id}`); }
-    catch (e) { toast(e.message, true); }
+    S.tried.add(j.id);
+    try { await queueAction({ ...j, count: 1 }, `${j.stale ? "update" : "auto"}: ${ent?.name || j.id}`); queued++; }
+    catch (e) { S.autoFailed++; toast(e.message, true); }
   }
   for (const v of S.pending.values()) v.auto = true;
+  if (!queued && !S.pending.size) autoFillStep();  // nothing of this group could be queued: try the next group
 }
 
 // ------------------------------------------------------------------ panel shell
@@ -287,6 +318,7 @@ function render() {
   const tr = S.root.querySelector(".dr-track"); if (tr) tr.scrollLeft = scroll;
   updateProgressUI();
   S.finishRedraw?.();
+  S.staleRedraw?.();
 }
 
 // ------------------------------------------------------------------ header
@@ -301,8 +333,10 @@ function renderHeader() {
     S.project && h("button", { onclick: () => settingsDialog() }, "Settings"),
     h("span", { class: "sp" }),
     n ? h("span", { class: "dr-q" }, h("span", { class: "dr-spin" }), h("span", { class: "lb" }, ""), h("span", { class: "bar" }, h("i"))) : null,
-    S.project && h("button", { class: S.autofill ? "warn" : "", title: "Generate every keyframe and clip whose inputs are ready, then continue down the timeline as results arrive",
-      onclick: () => { S.autofill = !S.autofill; render(); if (S.autofill) autoFillStep(); } }, S.autofill ? "■ Stop auto-fill" : "⚡ Auto-fill gaps"),
+    S.project && staleCount().total && S.autofill !== "stale" ? h("button", { class: "stale", title: "Takes made from keyframes or clips whose selected take has since changed", onclick: staleDialog },
+      `↻ ${staleCount().direct} stale` + (staleCount().downstream ? ` +${staleCount().downstream}` : "")) : null,
+    S.project && h("button", { class: S.autofill ? "warn" : "", title: "Generate every keyframe and clip whose inputs are ready, then continue down the timeline as results arrive. Works through one model at a time to avoid reloading weights.",
+      onclick: () => (S.autofill ? stopAutofill() : startAutofill("gaps")) }, S.autofill === "stale" ? "■ Stop updating" : S.autofill ? "■ Stop auto-fill" : "⚡ Auto-fill gaps"),
     S.project && h("button", { title: "Render the selected takes at the project size, as generated", onclick: () => doRender(false) }, "▶ Render draft"),
     S.project && h("button", { class: "pri", title: "Upscale the selected takes to the delivery size and render the final video", onclick: () => finishDialog() },
       `✨ Final ${finishLabel()}…`),
@@ -353,6 +387,7 @@ function renderLibrary() {
       },
         th ? h("img", { src: th, loading: "lazy" }) : h("div", { class: "ph" }, pend ? h("span", { class: "dr-spin" }) : "not generated"),
         kf.takes?.length > 1 ? h("span", { class: "cnt" }, `${kf.takes.length} takes`) : null,
+        S.status.keyframes[kf.id]?.stale?.length ? h("span", { class: "dr-stalemark", title: "Out of date: " + S.status.keyframes[kf.id].stale.join("; ") }, "↻") : null,
         h("div", { class: "nm" }, h("span", { class: "dr-badge " + kf.recipe.op }, kf.recipe.op), pend ? h("span", { class: "dr-spin" }) : null, " ", kf.name || kf.id));
     })),
     h("div", { class: "dr-help", style: { marginTop: "12px" } }, "Drag a keyframe onto the left or right half of a clip in the timeline to make it that clip's start or end frame."));
@@ -579,6 +614,7 @@ function inspectKeyframe(kf) {
       projectRefsNote(kf),
       h("label", {}, qi21() ? "LoRAs (Qwen Image 2.1)" : "LoRAs (Qwen)"), loraEditor(JSON.parse(JSON.stringify(rec.loras || [])), (l) => upd({ recipe: { loras: l } }), false),
       h("div", { class: "dr-status " + (st.ready ? "ok" : "no") }, st.ready ? "Ready to generate" : `Not ready: ${st.why}`),
+      staleBox("keyframe", kf, st),
       h("div", { class: "dr-actions" }, h("div", { class: "dr-row", style: { flex: "1 1 100%" } }, countPicker(),
         h("button", { class: "pri", disabled: !st.ready, onclick: () => generate({ action: "keyframe.generate", id: kf.id, count: getCount() }, kf.name || "keyframe") }, "Generate takes"))));
   } else if (rec.op === "grab" && rec.source) {
@@ -695,6 +731,7 @@ function inspectSegment(seg) {
       ...motionSection(seg, idx, upd),
       h("label", {}, "LoRAs (Wan)"), loraEditor(JSON.parse(JSON.stringify(seg.loras || [])), (l) => upd({ loras: l }), true),
       h("div", { class: "dr-status " + (st.ready ? "ok" : "no") }, st.ready ? `Ready · ${MODE_DESC[st.mode] || st.mode}${st.why ? ` (${st.why})` : ""}` : `Not ready: ${st.why}`),
+      staleBox("segment", seg, st),
       h("div", { class: "dr-actions" }, h("div", { class: "dr-row", style: { flex: "1 1 100%" } }, countPicker(),
         h("button", { class: "pri", disabled: !st.ready, onclick: () => generate({ action: "segment.generate", id: seg.id, count: getCount() }, seg.name || "clip") }, "Generate takes"))));
   }
@@ -715,8 +752,9 @@ function inspectSegment(seg) {
 // ------------------------------------------------------------------ timeline (bottom)
 function segStateDot(seg) {
   if (seg.kind === "still") return "static";
-  if (seg.takes?.length) return "done";
   const st = S.status.segments[seg.id];
+  if (st?.stale?.length) return "done stale";
+  if (seg.takes?.length) return st?.downstream ? "done downstream" : "done";
   return st?.ready ? "ready" : seg.kind === "generate" ? "blocked" : "static";
 }
 function renderTimeline() {
@@ -729,7 +767,7 @@ function renderTimeline() {
   box.append(h("div", { class: "dr-tlbar" },
     h("b", { style: { color: "#e6e6ea" } }, "Timeline"), `${S.project.timeline.length} clips · ${fmtSec(total, s.fps)}`,
     h("span", { style: { flex: 1 } }),
-    h("span", {}, h("span", { class: "dr-dot done" }), " has take  ", h("span", { class: "dr-dot ready" }), " ready  ", h("span", { class: "dr-dot blocked" }), " waiting  "),
+    h("span", {}, h("span", { class: "dr-dot done" }), " has take  ", h("span", { class: "dr-dot done stale" }), " out of date  ", h("span", { class: "dr-dot ready" }), " ready  ", h("span", { class: "dr-dot blocked" }), " waiting  "),
     "zoom", h("input", { type: "range", min: 0.5, max: 4, step: 0.1, value: S.zoom, oninput: (e) => { S.zoom = parseFloat(e.target.value); render(); } })));
   const segs = h("div", { class: "dr-segs" });
   S.project.timeline.forEach((seg, i) => {
@@ -938,6 +976,68 @@ function modelsPanel(s, md) {
     h("div", { class: "dr-help", style: { marginTop: "10px" } }, "Defaults come from config.json. Pick another file here to use it for this project only: a different precision or quantisation, a fine-tune, an all-in-one checkpoint (its text encoder and VAE can then be set to “From checkpoint”), or a GGUF file" + (files.gguf_installed ? "." : " (needs the ComfyUI-GGUF custom nodes, not detected).")),
     h("label", {}, "Keyframe model family"), family, groupsBox);
   return wrap;
+}
+
+// ------------------------------------------------------------------ stale takes
+// A take is stale when a keyframe or clip it was made from now has a different selected take.
+function staleCount() {
+  let direct = 0, downstream = 0;
+  for (const kind of ["keyframes", "segments"]) for (const v of Object.values(S.status?.[kind] || {})) {
+    if (v.stale?.length) direct++; else if (v.downstream) downstream++;
+  }
+  return { direct, downstream, total: direct + downstream };
+}
+const regenerate = (kind, ent) => generate({ action: `${kind}.generate`, id: ent.id, count: 1, select: true }, `update ${ent.name || ent.id}`);
+const keepTake = (kind, ent) => op({ op: `${kind}.keep`, id: ent.id });
+function staleBox(kind, ent, st) {
+  if (st?.stale?.length) {
+    return h("div", { class: "dr-status stale" },
+      h("div", {}, h("b", {}, "Out of date: "), st.stale.join("; "), "."),
+      h("div", { class: "dr-row", style: { marginTop: "6px" } },
+        h("button", { class: "pri", disabled: !st.ready, title: st.ready ? "Generate one new take from the current inputs; it replaces the selected take" : st.why, onclick: () => regenerate(kind, ent) }, "↻ Regenerate"),
+        h("button", { title: "Keep the selected take and treat it as up to date", onclick: () => keepTake(kind, ent) }, "Keep as is")));
+  }
+  if (st?.downstream) return h("div", { class: "dr-status downstream" }, "Built from something that is out of date; it will be too once that is regenerated.");
+  return null;
+}
+async function staleDialog() {
+  let m;
+  const body = h("div", { style: { width: "640px" } });
+  const draw = () => {
+    if (!document.body.contains(m)) { S.staleRedraw = null; return; }
+    const items = [], down = [];
+    for (const kf of Object.values(S.project.keyframes)) {
+      const st = S.status.keyframes[kf.id];
+      if (st?.stale?.length) items.push(["keyframe", kf, st]); else if (st?.downstream) down.push(kf.name || kf.id);
+    }
+    for (const seg of S.project.timeline) {
+      const st = S.status.segments[seg.id];
+      if (st?.stale?.length) items.push(["segment", seg, st]); else if (st?.downstream) down.push(seg.name || seg.id);
+    }
+    if (!items.length && !down.length) { m.remove(); S.staleRedraw = null; return; }
+    body.replaceChildren(
+      h("h2", {}, "Out-of-date takes"),
+      h("div", { class: "dr-help" }, "These were generated from a keyframe or clip that has since got a different selected take (regenerated, inpainted, re-selected or swapped). Regenerate them, or keep them if the change doesn’t matter."),
+      h("div", { class: "dr-stalelist" }, items.map(([kind, ent, st]) => {
+        const pend = pendingFor(`${kind}:${ent.id}`);
+        return h("div", { class: "row" },
+          h("div", {}, h("b", {}, (kind === "keyframe" ? "▣ " : "") + (ent.name || ent.id)), h("div", { class: "dr-help", style: { margin: 0 } }, st.stale.join("; "))),
+          pend ? h("span", { class: "dr-chip run" }, h("span", { class: "dr-spin" }), " generating") :
+            h("button", { disabled: !st.ready, title: st.ready ? "" : st.why, onclick: () => { regenerate(kind, ent); } }, "↻ Regenerate"),
+          h("button", { disabled: !!pend, onclick: () => keepTake(kind, ent) }, "Keep"));
+      })),
+      down.length ? h("div", { class: "dr-help" }, `Further down the chain (stale once the above are regenerated): ${down.join(", ")}.`) : null,
+      h("div", { class: "dr-actions" }, h("span", { style: { flex: 1 } }),
+        h("button", { onclick: () => { m.remove(); S.staleRedraw = null; } }, "Close"),
+        items.length ? h("button", { onclick: async () => {
+          const d = await J(`/director/project/${S.pid}/op`, { body: items.map(([kind, ent]) => ({ op: `${kind}.keep`, id: ent.id })) });
+          applyData(d); render(); } }, "Keep all") : null,
+        h("button", { class: "pri", title: "Regenerate every stale take, then whatever becomes stale because of that, down the timeline (one new take each, which replaces the selection)",
+          onclick: () => { m.remove(); S.staleRedraw = null; startAutofill("stale"); } }, "↻ Update all")));
+  };
+  m = modal(body, () => { S.staleRedraw = null; });
+  S.staleRedraw = draw;
+  draw();
 }
 
 // ------------------------------------------------------------------ finishing (upscale / refine / interpolate)

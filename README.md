@@ -96,6 +96,21 @@ With the VACE bridge, the last *N* frames of the previous clip (and/or the first
 
 **Auto-fill.** Queues everything whose inputs are ready, waits, picks up whatever became ready because of those results, and keeps going down the timeline until nothing more can be generated. The first take of each item is auto-selected, so a fully planned timeline can be filled in one pass. Afterwards you can regenerate any clip you don't like.
 
+Auto-fill works through **one model at a time**. Switching between Qwen Image and the different Wan models means reloading many gigabytes of weights. Consecutive jobs that use the same weights reuse the model ComfyUI already has loaded. So each step queues one group of ready jobs that share their diffusion models, chosen in this order:
+1. the group whose weights are already loaded;
+2. otherwise keyframes, because they unlock clips;
+3. otherwise the largest group.
+
+Work that becomes ready in the meantime waits for a later step with the same model. Each item is tried at most once per run: a job that fails is reported and not retried, and the run ends with a summary.
+
+**Stale takes.** Every generated take records which take of each keyframe and clip it was made from: its parent and reference keyframes, its start and end keyframes, the clip it continues from or leads into, and its control clip. If one of those later gets a different selected take, the take is marked **out of date**. That happens when an input is regenerated, inpainted, re-selected or swapped for another keyframe. Clips built from an out-of-date item are marked as *downstream*, since they will be out of date once it is regenerated.
+- The header shows **↻ N stale**. Its dialog lists each item with the reason, for example "keyframe 'Lighthouse' has a different take selected".
+- Each item can be regenerated (one new take, which replaces the selection) or kept as it is.
+- **↻ Update all** runs auto-fill on the stale items. Each regenerated take makes whatever was built from it stale in turn, so the update cascades down the timeline. It is model-grouped like auto-fill, and each item is regenerated at most once per run.
+- Old takes are never deleted.
+- Projects created before this feature treat their current selection as up to date.
+- Prompt edits don't count as stale. Regenerate those clips yourself.
+
 **LoRAs.** Each keyframe has its own LoRA list (Qwen), and each clip has its own LoRA list (Wan). Project-wide image and video LoRAs, for example a character LoRA, are merged into every run. For Wan 2.2, each video LoRA can target the high-noise stage, the low-noise stage or both.
 
 **Video inpaint.** On a clip take, paint a region on the current frame and choose a frame range. Wan VACE regenerates that region over those frames. Everything outside the mask is composited back pixel-exact, the frames are spliced into the original clip, and the result is saved as a new take.
@@ -152,7 +167,7 @@ All graphs use core ComfyUI nodes plus these nodes. Open any queued job from the
 
 ## HTTP API (used by the panel)
 
-`GET/POST /director/projects`, `GET /director/project/{id}` (with a `finish` status block), `POST …/op` (fine-grained edits, so running jobs never lose results), `POST …/build` (returns API-format prompts; finishing actions are `finish.segment`, `finish.keyframe` and `finish.all`), `GET …/plan`, `POST …/upload`, `POST …/grab`, `POST …/render` (`{"final": true}` for the finished render), `GET /director/file/{id}/{path}`.
+`GET/POST /director/projects`, `GET /director/project/{id}` (with a `finish` status block), `POST …/op` (fine-grained edits, so running jobs never lose results), `POST …/build` (returns API-format prompts; finishing actions are `finish.segment`, `finish.keyframe` and `finish.all`), `GET …/plan` (the next auto-fill step: one model group; `?stale=1` includes stale takes, `?loaded=` is the loaded weights, `?skip=` the ids already tried), `POST …/upload`, `POST …/grab`, `POST …/render` (`{"final": true}` for the finished render), `GET /director/file/{id}/{path}`.
 
 ## Limits and notes
 
