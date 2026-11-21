@@ -19,7 +19,8 @@ The panel never asks you to wire nodes: it builds the right graph for each step,
 | Context bridging and video inpaint | `diffusion_models` | `wan2.1_vace_14B_fp16.safetensors` |
 | Wan text encoder, VAE | `text_encoders`, `vae` | `umt5_xxl_fp8_e4m3fn_scaled.safetensors`, `wan_2.1_vae.safetensors` |
 | Fast video (optional) | `loras` | Wan 2.2 lightx2v 4-step (high/low), lightx2v I2V distill for VACE |
-| Interpolate ×2 (optional) | `frame_interpolation` | `film_net_fp16.safetensors` |
+| Interpolate (optional) | `frame_interpolation` | `film_net_fp16.safetensors` (or a RIFE model) |
+| Final video upscaling | `upscale_models` | `4x-UltraSharp.pth` (any ESRGAN-family model ComfyUI can load) |
 
 Keyframes use 25 steps at cfg 1 (euler/simple), or 8 steps with the Turbo LoRA. At cfg 1 ComfyUI skips the negative prompt; raise `qwen21.quality.cfg` (2 at most) if you want it to count. To use the older Qwen-Image-2512 + Qwen-Image-Edit-2511 pair instead, set `"image_model": "qwen"`; that path is kept unchanged in the `qwen` section.
 
@@ -99,7 +100,7 @@ With the VACE bridge, the last *N* frames of the previous clip (and/or the first
 
 **Video inpaint.** On a clip take, paint a region on the current frame and choose a frame range. Wan VACE regenerates that region over those frames. Everything outside the mask is composited back pixel-exact, the frames are spliced into the original clip, and the result is saved as a new take.
 
-**Render.** Streams all selected takes into one mp4. Duplicate boundary frames are dropped where one clip starts on the frame the previous one ended on, and trims are applied. *Interpolate ×2* runs FILM on the render.
+**Render.** *▶ Render draft* streams all selected takes into one mp4 at the project size. Duplicate boundary frames are dropped where one clip starts on the frame the previous one ended on, and trims are applied. *✨ Final* makes the delivery version (see [Final video](#final-video-upscaling-to-1080p)). *Interpolate ×2* on a draft render runs FILM on the whole render; for the final video, set the frame rate in ✨ Final instead.
 
 ## Typical session
 
@@ -108,7 +109,30 @@ With the VACE bridge, the last *N* frames of the previous clip (and/or the first
 3. Build the timeline. You can drag a keyframe onto the left or right half of a clip, use *+ Clip starting here* from a keyframe, use *+ Extend* (continues from the previous clip), or *Import video*.
 4. Write what happens in each clip, then press **⚡ Auto-fill gaps**, or **Generate takes** on individual clips.
 5. Review the clips. Select better takes, inpaint any problem areas, use *Frame → keyframe* to start a new branch from any frame, and *Split* clips that are too long.
-6. **▶ Render timeline**.
+6. **▶ Render draft** to check the cut, then **✨ Final** to upscale and render the delivery version.
+
+## Final video: upscaling to 1080p
+
+Clips are generated at the project size (832×480 or 1280×720) because that is where Wan is fast. **✨ Final** in the header upscales the timeline to the delivery size, by default **1920×1080**. The output keeps the project's aspect ratio at the chosen short side (720p, 1080p, 1440p or 2160p); within 3% of 16:9 it snaps to the standard size, so 832×480 becomes 1920×1080 with a thin strip cropped.
+
+Finishing works **per take**, not on the render. Each clip's selected take, and each keyframe held as a still, gets a *finished* version stored with the take together with the settings it was made with. As a result:
+- memory stays bounded (one clip at a time, never the whole film);
+- re-rendering costs nothing, and picking a different take or changing one clip only re-finishes that clip;
+- changing the finishing settings marks existing finished versions as *outdated* (amber **HD** badge), never mixing them silently.
+
+The dialog lists every item with its state. *✨ Finish N* queues everything missing or outdated, and *▶ Render final* writes the mp4. A clip that isn't finished is resized in the render, and the result reports it. In the viewer, *✨ Finish* does a single take, and *Show draft / Show finished* compares the two.
+
+| Method | What it does | Cost |
+|---|---|---|
+| **Resize only** | Antialiased resize. | None; nothing is queued. |
+| **Upscale model** (default) | An ESRGAN-family model (`models/upscale_models`, e.g. 4x-UltraSharp) on every frame, then resized to the output size. Frames go through in small batches, so the 4× intermediate never exists for a whole clip. | Seconds per clip. Fine texture can shimmer slightly, since each frame is upscaled on its own. |
+| **Wan refine + upscale model** | Upscales to the refine size (720p by default) and runs a short low-denoise pass (0.3) of the **Wan 2.2 text→video low-noise** model with the clip's prompt and LoRAs. This adds real detail that stays consistent over time. The result is colour-matched back to the draft (`DirectorColorMatch`) and upscaled to the output size. Clips longer than one generation (imports) are refined in overlapping windows that are crossfaded together. | About one fast generation per clip at the refine size (4 steps with the lightx2v LoRA when *Fast video* is on, otherwise 10 steps at CFG 3.5). Refining at 1080p takes roughly 2–3× as long. |
+
+**Frame rate.** The final video can be interpolated ×2–×4 (16 → 32 fps and so on). Interpolation runs per clip, after upscaling. Each clip starts and ends on its original frames, so joins stay exact: a clip that continues the previous one keeps the in-between frames leading into it, and a cut holds the last frame. Every clip is then exactly *m* times its draft length, which keeps timing (and any later soundtrack) in sync with the draft.
+
+**Memory.** Frames are held in RAM as 32-bit floats: about 25 MB per 1080p frame. An 81-frame clip at 1080p needs about 2 GB, or about 6 GB with ×2 interpolation. Interpolating at 4K needs several times that.
+
+Defaults are in `config.json` → `finish` (output short side, method, upscale model, refine size, denoise, model and steps). Each project can override them in **Settings → Finishing** or directly in the ✨ Final dialog.
 
 ## Nodes
 
@@ -119,14 +143,16 @@ All graphs use core ComfyUI nodes plus these nodes. Open any queued job from the
 | `DirectorLoadImage` / `DirectorLoadMask` / `DirectorLoadVideoFrames` | Load project-relative files. Paths are restricted to the project folder. |
 | `DirectorVaceBridge` | Builds `[context before] + [gray frames to generate] + [context after]` with masks, padded to Wan's 4k+1 length. |
 | `DirectorVaceInpaint`, `DirectorCompositeFrames` | Masked VACE control video, and an exact composite back onto the original frames. |
-| `DirectorColorMatch` | Per-frame gain/offset colour correction measured on reference pixels (context frames, or a ring around a mask), interpolated over frames without reference. |
+| `DirectorColorMatch` | Per-frame gain/offset colour correction measured on reference pixels (context frames, a ring around a mask, or with no mask the whole frame), interpolated over frames without reference. |
 | `DirectorMaskCrop`, `DirectorMaskStitch` | Crop-and-stitch inpainting at full model resolution (crops rounded to multiples of 32 for Qwen Image 2.1). |
 | `DirectorEmptyLatent` | Empty latent of any channel count and scale; used for Qwen Image 2.1 text→image (64 channels, 1/16) at the video's aspect ratio. |
-| `DirectorSaveImage`, `DirectorSaveVideo` | Write results and register them as takes. `DirectorSaveVideo` can also trim context frames and splice frames into a source clip. |
+| `DirectorUpscaleFrames` | Exact-size upscale: an optional upscale model, then an antialiased resize with a centre crop. Runs a few frames at a time. |
+| `DirectorPadFrames`, `DirectorFrameRange`, `DirectorJoinFrames` | Pad to Wan's 4k+1 length and trim back; join overlapping refine windows with a crossfade. |
+| `DirectorSaveImage`, `DirectorSaveVideo` | Write results and register them as takes. `DirectorSaveVideo` can also trim context frames and splice frames into a source clip. With a `finish:<segment\|keyframe>:<id>:<take>` target, both store the take's finished version instead. |
 
 ## HTTP API (used by the panel)
 
-`GET/POST /director/projects`, `GET /director/project/{id}`, `POST …/op` (fine-grained edits, so running jobs never lose results), `POST …/build` (returns API-format prompts), `GET …/plan`, `POST …/upload`, `POST …/grab`, `POST …/render`, `GET /director/file/{id}/{path}`.
+`GET/POST /director/projects`, `GET /director/project/{id}` (with a `finish` status block), `POST …/op` (fine-grained edits, so running jobs never lose results), `POST …/build` (returns API-format prompts; finishing actions are `finish.segment`, `finish.keyframe` and `finish.all`), `GET …/plan`, `POST …/upload`, `POST …/grab`, `POST …/render` (`{"final": true}` for the finished render), `GET /director/file/{id}/{path}`.
 
 ## Limits and notes
 
@@ -139,4 +165,4 @@ All graphs use core ComfyUI nodes plus these nodes. Open any queued job from the
 - The video-inpaint mask is static across the frame range. Paint generously around moving objects. A tracked mask (SAM) would be a natural next step.
 - Long chains of image→video clips can drift in colour. Using VACE context instead of single-frame continuation, and re-anchoring on a keyframe every few clips, keeps this under control.
 
-`examples/` contains API-format graphs produced by the panel for each operation, for reference. The `qi21_*` files are the Qwen Image 2.1 keyframe graphs: text→image with and without references, edit with references, and inpaint. The others cover the video side and the legacy Qwen path.
+`examples/` contains API-format graphs produced by the panel for each operation, for reference. The `qi21_*` files are the Qwen Image 2.1 keyframe graphs: text→image with and without references, edit with references, and inpaint. The `finish_*` files are the finishing graphs: an upscale model, Wan refine with ×2 interpolation, and a still. The others cover the video side and the legacy Qwen path.

@@ -1,0 +1,64 @@
+{
+ "1": {
+  "class_type": "UpscaleModelLoader",
+  "inputs": {
+   "model_name": "4x-UltraSharp.pth"
+  },
+  "_meta": {
+   "title": "Upscale model"
+  }
+ },
+ "2": {
+  "class_type": "DirectorLoadVideoFrames",
+  "inputs": {
+   "project": "example",
+   "path": "clips/seg_e5f6a7b8/take_a1b2c3d4.mp4",
+   "start": 0,
+   "count": -1,
+   "width": 0,
+   "height": 0
+  },
+  "_meta": {
+   "title": "Take frames"
+  }
+ },
+ "3": {
+  "class_type": "DirectorUpscaleFrames",
+  "inputs": {
+   "images": [
+    "2",
+    0
+   ],
+   "width": 1920,
+   "height": 1080,
+   "batch": 4,
+   "upscale_model": [
+    "1",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Upscale"
+  }
+ },
+ "4": {
+  "class_type": "DirectorSaveVideo",
+  "inputs": {
+   "images": [
+    "3",
+    0
+   ],
+   "project": "example",
+   "target": "finish:segment:seg_e5f6a7b8:take_a1b2c3d4",
+   "fps": 16,
+   "trim_start": 0,
+   "trim_end": 0,
+   "splice_source": "",
+   "splice_start": 0,
+   "meta": "{\"key\": \"{\\\"h\\\": 1080, \\\"i\\\": 1, \\\"m\\\": \\\"model\\\", \\\"u\\\": \\\"4x-UltraSharp.pth\\\", \\\"w\\\": 1920}\", \"multiplier\": 1, \"source\": \"clips/seg_e5f6a7b8/take_a1b2c3d4.mp4\", \"method\": \"model\", \"upscale_model\": \"4x-UltraSharp.pth\"}"
+  },
+  "_meta": {
+   "title": "DirectorSaveVideo"
+  }
+ }
+}

@@ -254,18 +254,21 @@ class DirectorColorMatch:
         return {"required": {
             "images": ("IMAGE",),
             "reference": ("IMAGE",),
-            "ref_mask": ("MASK",),
             "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+        }, "optional": {
+            "ref_mask": ("MASK", {"tooltip": "Pixels that should match the reference; unconnected = the whole frame"}),
         }}
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "run"
     CATEGORY = CAT
 
-    def run(self, images, reference, ref_mask, strength):
+    def run(self, images, reference, strength, ref_mask=None):
         if strength <= 0:
             return (images,)
         n, H, W, _ = images.shape
+        if ref_mask is None:
+            ref_mask = torch.ones(1, H, W)
         ref = reference[..., :3]
         if ref.shape[1:3] != (H, W):
             ref = F.interpolate(ref.movedim(-1, 1), size=(H, W), mode="bilinear").movedim(1, -1)
@@ -446,6 +449,152 @@ class DirectorEmptyLatent:
                                         device=mm.intermediate_device())},)
 
 
+# --------------------------------------------------------------------- finishing
+
+def _resize_frames(x, width, height, fit="cover"):
+    """x: (N,H,W,C) -> (N,height,width,C). Centre-crops to the target aspect ('cover'), then resizes
+    with antialiasing so a 4x model output comes down cleanly."""
+    _, h, w, _ = x.shape
+    if (h, w) == (height, width):
+        return x
+    if fit == "cover":
+        ar, tar = w / h, width / height
+        if ar > tar + 1e-6:
+            cw = max(1, round(h * tar)); x0 = (w - cw) // 2
+            x = x[:, :, x0:x0 + cw]
+        elif ar < tar - 1e-6:
+            ch = max(1, round(w / tar)); y0 = (h - ch) // 2
+            x = x[:, y0:y0 + ch]
+    y = F.interpolate(x.movedim(-1, 1).float(), size=(height, width), mode="bicubic", align_corners=False,
+                      antialias=True)
+    return y.clamp(0, 1).movedim(1, -1).to(x.dtype)
+
+
+def _run_upscale_model(model, x):
+    """Same tiling as ComfyUI's ImageUpscaleWithModel, on a small batch. x: (N,H,W,3) -> upscaled."""
+    import comfy.utils
+    import comfy.model_management as mm
+    patcher = getattr(model, "patcher", None)
+    if patcher is not None:
+        device = patcher.load_device
+        need = (512 * 512 * 3) * x.element_size() * max(model.scale, 1.0) * 384.0 + x.nelement() * x.element_size()
+        mm.load_models_gpu([patcher], memory_required=need, force_full_load=True)
+    else:  # older ComfyUI: the loader returned a bare spandrel descriptor
+        device = mm.get_torch_device()
+        model.to(device)
+    inp = x.movedim(-1, -3).to(device)
+    tile, overlap = 512, 32
+    while True:
+        try:
+            s = comfy.utils.tiled_scale(inp, lambda a: model(a.float()), tile_x=tile, tile_y=tile, overlap=overlap,
+                                        upscale_amount=model.scale, output_device=mm.intermediate_device())
+            break
+        except Exception as e:
+            if not isinstance(e, mm.OOM_EXCEPTION) or tile <= 128:
+                raise
+            tile //= 2
+            mm.soft_empty_cache()
+    return s.movedim(-3, -1).clamp(0, 1)
+
+
+class DirectorUpscaleFrames:
+    """Upscales frames to an exact size: an optional upscale model (ESRGAN family, from
+    models/upscale_models) followed by an antialiased resize with a centre crop to the target aspect.
+    Works through the clip a few frames at a time, so the model's 4x intermediate never exists for
+    the whole clip at once."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {
+            "images": ("IMAGE",),
+            "width": ("INT", {"default": 1920, "min": 16, "max": 8192, "step": 2}),
+            "height": ("INT", {"default": 1080, "min": 16, "max": 8192, "step": 2}),
+            "batch": ("INT", {"default": 4, "min": 1, "max": 64, "tooltip": "Frames per upscale-model call"}),
+        }, "optional": {
+            "upscale_model": ("UPSCALE_MODEL",),
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = CAT
+
+    def run(self, images, width, height, batch=4, upscale_model=None):
+        x = images[..., :3]
+        if upscale_model is None:
+            return (_resize_frames(x, width, height),)
+        import comfy.utils
+        n = x.shape[0]
+        out = None
+        pbar = comfy.utils.ProgressBar(n)
+        for i in range(0, n, batch):
+            y = _resize_frames(_run_upscale_model(upscale_model, x[i:i + batch]), width, height).cpu()
+            if out is None:
+                out = torch.empty((n, height, width, 3), dtype=y.dtype)
+            out[i:i + y.shape[0]] = y
+            pbar.update_absolute(min(n, i + batch), n)
+        return (out,)
+
+
+class DirectorPadFrames:
+    """Repeats the last frame up to `length` (e.g. Wan's 4k+1); returns how many were added."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "length": ("INT", {"default": 81, "min": 1, "max": 100000})}}
+
+    RETURN_TYPES = ("IMAGE", "INT")
+    RETURN_NAMES = ("images", "added")
+    FUNCTION = "run"
+    CATEGORY = CAT
+
+    def run(self, images, length):
+        n = images.shape[0]
+        if n >= length:
+            return (images, 0)
+        return (torch.cat([images, images[-1:].expand(length - n, -1, -1, -1)], 0), length - n)
+
+
+class DirectorFrameRange:
+    """Frames start .. start+count-1 of a batch (count -1 = to the end)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"images": ("IMAGE",), "start": ("INT", {"default": 0, "min": 0, "max": 100000}),
+                             "count": ("INT", {"default": -1, "min": -1, "max": 100000})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = CAT
+
+    def run(self, images, start, count):
+        end = images.shape[0] if count < 0 else start + count
+        return (images[start:end],)
+
+
+class DirectorJoinFrames:
+    """Joins two frame batches whose last/first `overlap` frames show the same moment, with a linear
+    crossfade over the overlap (used to stitch refine windows of a long clip)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"a": ("IMAGE",), "b": ("IMAGE",),
+                             "overlap": ("INT", {"default": 8, "min": 0, "max": 1000})}}
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "run"
+    CATEGORY = CAT
+
+    def run(self, a, b, overlap):
+        if b.shape[1:3] != a.shape[1:3]:
+            b = _resize_frames(b, a.shape[2], a.shape[1])
+        o = min(int(overlap), a.shape[0], b.shape[0])
+        if o <= 0:
+            return (torch.cat([a, b], 0),)
+        w = torch.linspace(0, 1, o + 2, dtype=a.dtype)[1:-1].view(o, 1, 1, 1).to(a.device)
+        mid = a[-o:] * (1 - w) + b[:o].to(a.device) * w
+        return (torch.cat([a[:-o], mid, b[o:].to(a.device)], 0),)
+
+
 # --------------------------------------------------------------------- savers
 
 def _parse_meta(meta):
@@ -472,6 +621,17 @@ class DirectorSaveImage:
 
     def save(self, images, project, target, meta):
         kind, _, eid = target.partition(":")
+        if kind == "finish":  # finish:keyframe:<kf id>:<take id> -> finished version of that take
+            _, fkind, feid, ftid = target.split(":")
+            rel = f"keyframes/{feid}/{ftid}_{P.new_id('fin')}.png"  # new name each time: files are served as immutable
+            os.makedirs(os.path.dirname(P.safe_path(project, rel)), exist_ok=True)
+            arr = _to_uint8(images[0][..., :3])
+            Image.fromarray(arr).save(P.safe_path(project, rel), compress_level=4)
+            info = _parse_meta(meta)
+            info.update({"file": rel, "width": int(arr.shape[1]), "height": int(arr.shape[0])})
+            P.set_finished(project, target, info)
+            return {"ui": {"images": [{"filename": os.path.basename(rel), "subfolder": f"director/{project}/keyframes/{feid}",
+                                       "type": "output"}], "director": [{"project": project, "target": target}]}}
         rel_dir = f"keyframes/{eid}" if kind == "keyframe" else "renders"
         d = P.safe_path(project, rel_dir)
         os.makedirs(d, exist_ok=True)
@@ -494,7 +654,7 @@ class DirectorSaveVideo:
         return {"required": {
             "images": ("IMAGE",),
             "project": ("STRING", {"default": ""}),
-            "target": ("STRING", {"default": "", "tooltip": "segment:<id> or render:<name>"}),
+            "target": ("STRING", {"default": "", "tooltip": "segment:<id>, render:<name> or finish:segment:<id>:<take id>"}),
             "meta": ("STRING", {"default": "{}", "multiline": True}),
             "fps": ("INT", {"default": 16, "min": 1, "max": 120}),
             "trim_start": ("INT", {"default": 0, "min": 0, "max": 10000}),
@@ -523,6 +683,15 @@ class DirectorSaveVideo:
                     src[j] = a
             arrs = src
         kind, _, eid = target.partition(":")
+        if kind == "finish":  # finish:segment:<seg id>:<take id> -> finished version of that take
+            _, fkind, feid, ftid = target.split(":")
+            files = media.write_take_files(project, f"clips/{feid}", f"{ftid}_{P.new_id('fin')}", arrs, fps)
+            info = _parse_meta(meta)
+            info.update(files)
+            P.set_finished(project, target, info)
+            return {"ui": {"director": [{"project": project, "target": target, "file": files["file"]}],
+                           "images": [{"filename": os.path.basename(files["first"]),
+                                       "subfolder": f"director/{project}/clips/{feid}", "type": "output"}]}}
         tid = P.new_id("take")
         rel_dir = f"clips/{eid}" if kind == "segment" else "renders"
         stem = tid if kind == "segment" else f"{eid or 'render'}_{time.strftime('%Y%m%d_%H%M%S')}"
@@ -548,6 +717,10 @@ NODE_CLASS_MAPPINGS = {
     "DirectorMaskCrop": DirectorMaskCrop,
     "DirectorMaskStitch": DirectorMaskStitch,
     "DirectorEmptyLatent": DirectorEmptyLatent,
+    "DirectorUpscaleFrames": DirectorUpscaleFrames,
+    "DirectorPadFrames": DirectorPadFrames,
+    "DirectorFrameRange": DirectorFrameRange,
+    "DirectorJoinFrames": DirectorJoinFrames,
     "DirectorSaveImage": DirectorSaveImage,
     "DirectorSaveVideo": DirectorSaveVideo,
 }

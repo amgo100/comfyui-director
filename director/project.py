@@ -19,7 +19,12 @@ Segment
   end   : {type: none | keyframe | next, keyframe}
   mode  : auto | i2v | flf2v | t2v | vace
   context_frames: frames of neighbouring clips given to VACE (motion continuity)
-  takes : [{id, file, first, last, frames, first_is_anchor, last_is_anchor, ...}]
+  takes : [{id, file, first, last, frames, first_is_anchor, last_is_anchor, finished, ...}]
+
+Finishing
+  A take can carry a `finished` version: the same frames upscaled to the delivery size (optionally
+  refined with Wan and frame-interpolated). It is stored with the settings `key` it was made with,
+  so changing the finishing settings marks it outdated instead of silently mixing versions.
 """
 from __future__ import annotations
 
@@ -87,6 +92,7 @@ DEFAULT_SETTINGS = {
     "image_model": "",   # "" = config default, "qwen21" or "qwen"
     "flf_engine": "i2v",  # first/last-frame clips: "i2v" (Wan 2.2 I2V) or "fun_inp" (Wan 2.2 Fun InP)
     "models": {},        # model slot overrides, see director/models.py
+    "finish": {},        # finishing (upscale / refine / interpolate) overrides, see finish_settings()
 }
 
 SUBDIRS = ["keyframes", "clips", "masks", "imports", "renders"]
@@ -565,3 +571,171 @@ def plan(proj):
         if v["ready"] and not v["has_take"]:
             jobs.append({"action": "segment.generate", "id": sid})
     return jobs
+
+
+# -------------------------------------------------------------------- finishing
+
+FINISH_DEFAULTS = {
+    "width": 0, "height": 0,      # 0 = derived from short_side and the project's aspect ratio
+    "short_side": 1080,
+    "method": "model",            # resize | model | refine
+    "upscale_model": "4x-UltraSharp.pth",
+    "interpolate": 1,             # 1 = off, 2..4 = FILM/RIFE multiplier (fps x multiplier)
+    "interpolation_model": "",    # "" = config interpolation_model
+    "refine": {
+        "short_side": 720,        # Wan refines at this size, the upscale model takes it the rest of the way
+        "denoise": 0.3,
+        "model": "",              # "" = Wan text->video low-noise model
+        "fast_lora": "",          # "" = that model's fast LoRA; "@none" = none
+        "color_match": 1.0,
+        "window": 81, "overlap": 8,
+        "fast": {"steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple"},
+        "quality": {"steps": 10, "cfg": 3.5, "sampler": "euler", "scheduler": "simple"},
+    },
+}
+FINISH_METHODS = ("resize", "model", "refine")
+
+
+def _merge(a, b):
+    out = copy.deepcopy(a)
+    for k, v in (b or {}).items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _merge(out[k], v)
+        elif v is not None and v != "":   # empty = keep the default
+            out[k] = v
+    return out
+
+
+def even(x):
+    return max(2, int(round(x / 2)) * 2)
+
+
+def size_for_short_side(settings, short):
+    """Size with the project's aspect ratio and the given short side. Within 3% of 16:9 / 9:16
+    it snaps to the standard delivery size (832x480 -> 1920x1080), cropping a sliver."""
+    w, h = int(settings["width"]), int(settings["height"])
+    short = int(short)
+    ar = w / h
+    if abs(ar - 16 / 9) / (16 / 9) < 0.03:
+        return even(short * 16 / 9), short
+    if abs(ar - 9 / 16) / (9 / 16) < 0.03:
+        return short, even(short * 16 / 9)
+    if w >= h:
+        return even(short * ar), short
+    return short, even(short / ar)
+
+
+def finish_settings(proj, cfg=None):
+    """Effective finishing settings: built-in defaults <- config.json 'finish' <- project settings."""
+    fs = _merge(FINISH_DEFAULTS, (cfg or {}).get("finish") or {})
+    fs = _merge(fs, proj["settings"].get("finish") or {})
+    if fs.get("method") not in FINISH_METHODS:
+        fs["method"] = "model"
+    if not fs.get("interpolation_model"):
+        fs["interpolation_model"] = (cfg or {}).get("interpolation_model", "film_net_fp16.safetensors")
+    fs["interpolate"] = max(1, min(4, int(fs.get("interpolate") or 1)))
+    if fs.get("width") and fs.get("height"):
+        fs["width"], fs["height"] = even(fs["width"]), even(fs["height"])
+    else:
+        fs["width"], fs["height"] = size_for_short_side(proj["settings"], fs.get("short_side") or 1080)
+    rw, rh = size_for_short_side(proj["settings"], fs["refine"].get("short_side") or 720)
+    # Wan works on multiples of 16; never refine above the output size
+    if rw * rh > fs["width"] * fs["height"]:
+        rw, rh = fs["width"], fs["height"]
+    fs["refine"]["width"], fs["refine"]["height"] = int(rw // 16 * 16), int(rh // 16 * 16)
+    fs["fps"] = int(proj["settings"]["fps"]) * fs["interpolate"]
+    return fs
+
+
+def finish_key(fs, kind="video", fast_video=True):
+    """Identifies what a finished file was made with. Stills ignore refine and interpolation."""
+    k = {"w": fs["width"], "h": fs["height"], "m": fs["method"]}
+    if fs["method"] != "resize":
+        k["u"] = fs.get("upscale_model") or ""
+    if kind == "video":
+        k["i"] = fs["interpolate"]
+        if fs["interpolate"] > 1:
+            k["im"] = fs["interpolation_model"]
+        if fs["method"] == "refine":
+            r = fs["refine"]
+            k["r"] = [r["width"], r["height"], float(r["denoise"]), r.get("model") or "", r.get("fast_lora") or "",
+                      bool(fast_video), float(r.get("color_match", 1.0))]
+    elif fs["method"] == "refine":
+        k["m"] = "model"
+    return json.dumps(k, sort_keys=True)
+
+
+def finished_of(take, key):
+    f = (take or {}).get("finished")
+    return f if f and f.get("key") == key else None
+
+
+def set_finished(pid: str, target: str, info: dict):
+    """target = 'finish:<segment|keyframe>:<entity id>:<take id>'."""
+    parts = target.split(":")
+    if len(parts) != 4 or parts[0] != "finish":
+        raise ValueError(f"bad finish target {target!r}")
+    _, kind, eid, tid = parts
+    with edit(pid) as proj:
+        ent = proj["keyframes"].get(eid) if kind == "keyframe" else find_segment(proj, eid)[1]
+        if ent is None:
+            raise KeyError(f"{kind} {eid} not found")
+        take = next((t for t in ent.get("takes", []) if t["id"] == tid), None)
+        if take is None:
+            raise KeyError(f"take {tid} not found")
+        old = take.get("finished") or {}
+        take["finished"] = dict(info, created=time.time())
+    for k in ("file", "first", "last"):  # the replaced version is not referenced anywhere else
+        if old.get(k) and old[k] not in (info.get("file"), info.get("first"), info.get("last")):
+            try:
+                os.remove(safe_path(pid, old[k]))
+            except OSError:
+                pass
+    return take
+
+
+def finish_items(proj, cfg=None):
+    """Everything the final render needs: the selected take of every clip, and of every keyframe
+    held as a still. Each item: {kind, id, take, name, state: ok|outdated|missing|no_take}."""
+    fs = finish_settings(proj, cfg)
+    fast = proj["settings"].get("fast_video", True)
+    vkey, skey = finish_key(fs, "video", fast), finish_key(fs, "still")
+    items, seen = [], set()
+    # with 'resize only' the render resizes on the fly: stills never need finishing, clips only to interpolate
+    need_stills = fs["method"] != "resize"
+    need_clips = fs["method"] != "resize" or fs["interpolate"] > 1
+    for seg in proj["timeline"]:
+        if (seg["kind"] == "still" and not need_stills) or (seg["kind"] != "still" and not need_clips):
+            continue
+        if seg["kind"] == "still":
+            kid = seg.get("keyframe")
+            if not kid or kid in seen or kid not in proj["keyframes"]:
+                continue
+            seen.add(kid)
+            kf = proj["keyframes"][kid]
+            t = selected_take(kf)
+            kind, eid, name, key = "keyframe", kid, kf.get("name") or kid, skey
+        else:
+            t = selected_take(seg)
+            kind, eid, name, key = "segment", seg["id"], seg.get("name") or seg["id"], vkey
+        if not t:
+            state = "no_take"
+        elif finished_of(t, key):
+            state = "ok"
+        elif t.get("finished"):
+            state = "outdated"
+        else:
+            state = "missing"
+        items.append({"kind": kind, "id": eid, "take": t["id"] if t else None, "name": name, "state": state})
+    return items
+
+
+def finish_status(proj, cfg=None):
+    fs = finish_settings(proj, cfg)
+    items = finish_items(proj, cfg)
+    count = {s: sum(1 for i in items if i["state"] == s) for s in ("ok", "outdated", "missing", "no_take")}
+    return {"settings": fs, "items": items, "count": count,
+            "video_key": finish_key(fs, "video", proj["settings"].get("fast_video", True)),
+            "still_key": finish_key(fs, "still")}

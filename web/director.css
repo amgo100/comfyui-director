@@ -128,3 +128,13 @@
 .dr-region .thumb{position:relative;line-height:0;border-radius:6px;overflow:hidden;background:#262832}
 .dr-region .thumb img{width:100%;aspect-ratio:16/9;object-fit:cover}
 .dr-region .thumb img.mask{position:absolute;inset:0;mix-blend-mode:screen;opacity:.75;filter:sepia(1) saturate(6) hue-rotate(-40deg)}
+.dr-badge.fin{background:#2d5a3a;color:#c9f0d4;font-weight:700;position:absolute;right:4px;bottom:28px;z-index:2;margin:0;box-shadow:0 1px 4px #0008}
+.dr-badge.fin.old{background:#5a4a2a;color:#f0dcb0}
+.dr-fin{display:grid;grid-template-columns:1fr 300px;gap:16px;align-items:start}
+.dr-finlist{display:flex;flex-direction:column;gap:3px;max-height:340px;overflow:auto;border:1px solid #2e3039;border-radius:8px;padding:6px}
+.dr-finlist .row{display:grid;grid-template-columns:1fr auto 30px;gap:6px;align-items:center;font-size:12px}
+.dr-finlist .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dr-modal .dr-finlist button{padding:1px 0;font-size:12px}
+.dr-chip{font-size:10.5px;padding:1px 6px;border-radius:4px;background:#30333e;color:#b9bccb;white-space:nowrap}
+.dr-chip.ok{background:#2d5a3a;color:#c9f0d4}.dr-chip.old{background:#5a4a2a;color:#f0dcb0}.dr-chip.todo{background:#27405f;color:#c4d6f5}
+.dr-chip.run{background:#27405f;color:#c4d6f5}

@@ -157,6 +157,8 @@ def available():
                         + [{"value": f, "src": "gguf"} for f in te_gguf],
         "vae": [{"value": f, "src": "vae"} for f in _list("vae")],
         "lora": [{"value": f, "src": "loras"} for f in _list("loras")],
+        "upscale": [{"value": f, "src": "upscale_models"} for f in _list("upscale_models")],
+        "interpolation": [{"value": f, "src": "frame_interpolation"} for f in _list("frame_interpolation")],
         "gguf_installed": gguf,
     }
 
