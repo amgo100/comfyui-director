@@ -45,7 +45,7 @@ def _err(e, status=400):
 
 def _full(pid, extra=None):
     proj = P.load(pid)
-    d = {"project": proj, "status": P.status(proj)}
+    d = {"project": proj, "status": P.status(proj), "finish": P.finish_status(proj, load_config())}
     if extra:
         d.update(extra)
     return d
@@ -68,7 +68,8 @@ def register(routes):
         cfg = load_config()
         return web.json_response({"slots": M.slot_info(cfg), "groups": M.GROUPS, "dtypes": M.DTYPES,
                                   "image_model": cfg.get("image_model", "qwen21"), "files": M.available(),
-                                  "presets": M.PRESETS})
+                                  "presets": M.PRESETS, "finish_defaults": P.finish_settings(
+                                      {"settings": dict(P.DEFAULT_SETTINGS, finish={})}, cfg)})
 
     @routes.get("/director/projects")
     async def list_projects(request):
@@ -198,8 +199,10 @@ def register(routes):
     async def render(request):
         pid = request.match_info["pid"]
         try:
+            body = await request.json() if request.can_read_body else {}
+            final = bool((body or {}).get("final"))
             loop = asyncio.get_running_loop()
-            res = await loop.run_in_executor(None, media.render, pid)
+            res = await loop.run_in_executor(None, lambda: media.render(pid, final=final, cfg=load_config()))
             return _ok(**res)
         except Exception as e:
             traceback.print_exc()

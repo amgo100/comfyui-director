@@ -1,0 +1,306 @@
+{
+ "1": {
+  "class_type": "UpscaleModelLoader",
+  "inputs": {
+   "model_name": "4x-UltraSharp.pth"
+  },
+  "_meta": {
+   "title": "Upscale model"
+  }
+ },
+ "2": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Wan refine (low noise)"
+  }
+ },
+ "3": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "2",
+    0
+   ],
+   "lora_name": "wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors",
+   "strength_model": 1.0
+  },
+  "_meta": {
+   "title": "LoRA wan2.2_t2v_lightx2v_4steps_lora_v1.1_low_noise.safetensors"
+  }
+ },
+ "4": {
+  "class_type": "ModelSamplingSD3",
+  "inputs": {
+   "model": [
+    "3",
+    0
+   ],
+   "shift": 5.0
+  },
+  "_meta": {
+   "title": "ModelSamplingSD3"
+  }
+ },
+ "5": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+   "type": "wan",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "CLIPLoader"
+  }
+ },
+ "6": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "wan_2.1_vae.safetensors"
+  },
+  "_meta": {
+   "title": "VAELoader"
+  }
+ },
+ "7": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "5",
+    0
+   ],
+   "text": "the keeper climbs the cliff path at dusk, slow dolly-in"
+  },
+  "_meta": {
+   "title": "Prompt"
+  }
+ },
+ "8": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "5",
+    0
+   ],
+   "text": "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+  },
+  "_meta": {
+   "title": "Negative"
+  }
+ },
+ "9": {
+  "class_type": "DirectorLoadVideoFrames",
+  "inputs": {
+   "project": "example",
+   "path": "clips/seg_e5f6a7b8/take_a1b2c3d4.mp4",
+   "start": 0,
+   "count": 81,
+   "width": 0,
+   "height": 0
+  },
+  "_meta": {
+   "title": "Take frames"
+  }
+ },
+ "10": {
+  "class_type": "DirectorUpscaleFrames",
+  "inputs": {
+   "images": [
+    "9",
+    0
+   ],
+   "width": 1280,
+   "height": 720,
+   "batch": 4,
+   "upscale_model": [
+    "1",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Upscale to refine size"
+  }
+ },
+ "11": {
+  "class_type": "DirectorPadFrames",
+  "inputs": {
+   "images": [
+    "10",
+    0
+   ],
+   "length": 81
+  },
+  "_meta": {
+   "title": "DirectorPadFrames"
+  }
+ },
+ "12": {
+  "class_type": "VAEEncodeTiled",
+  "inputs": {
+   "pixels": [
+    "11",
+    0
+   ],
+   "vae": [
+    "6",
+    0
+   ],
+   "tile_size": 512,
+   "overlap": 64,
+   "temporal_size": 64,
+   "temporal_overlap": 8
+  },
+  "_meta": {
+   "title": "VAEEncodeTiled"
+  }
+ },
+ "13": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "4",
+    0
+   ],
+   "seed": 72612382905590,
+   "steps": 4,
+   "cfg": 1.0,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "positive": [
+    "7",
+    0
+   ],
+   "negative": [
+    "8",
+    0
+   ],
+   "latent_image": [
+    "12",
+    0
+   ],
+   "denoise": 0.3
+  },
+  "_meta": {
+   "title": "Refine"
+  }
+ },
+ "14": {
+  "class_type": "VAEDecodeTiled",
+  "inputs": {
+   "samples": [
+    "13",
+    0
+   ],
+   "vae": [
+    "6",
+    0
+   ],
+   "tile_size": 512,
+   "overlap": 64,
+   "temporal_size": 64,
+   "temporal_overlap": 8
+  },
+  "_meta": {
+   "title": "VAEDecodeTiled"
+  }
+ },
+ "15": {
+  "class_type": "DirectorFrameRange",
+  "inputs": {
+   "images": [
+    "14",
+    0
+   ],
+   "start": 0,
+   "count": 81
+  },
+  "_meta": {
+   "title": "DirectorFrameRange"
+  }
+ },
+ "16": {
+  "class_type": "DirectorColorMatch",
+  "inputs": {
+   "images": [
+    "15",
+    0
+   ],
+   "reference": [
+    "10",
+    0
+   ],
+   "strength": 1.0
+  },
+  "_meta": {
+   "title": "Colour match to the draft"
+  }
+ },
+ "17": {
+  "class_type": "DirectorUpscaleFrames",
+  "inputs": {
+   "images": [
+    "16",
+    0
+   ],
+   "width": 1920,
+   "height": 1080,
+   "batch": 4,
+   "upscale_model": [
+    "1",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Upscale to output size"
+  }
+ },
+ "18": {
+  "class_type": "FrameInterpolationModelLoader",
+  "inputs": {
+   "model_name": "film_net_fp16.safetensors"
+  },
+  "_meta": {
+   "title": "FrameInterpolationModelLoader"
+  }
+ },
+ "19": {
+  "class_type": "FrameInterpolate",
+  "inputs": {
+   "interp_model": [
+    "18",
+    0
+   ],
+   "images": [
+    "17",
+    0
+   ],
+   "multiplier": 2
+  },
+  "_meta": {
+   "title": "FrameInterpolate"
+  }
+ },
+ "20": {
+  "class_type": "DirectorSaveVideo",
+  "inputs": {
+   "images": [
+    "19",
+    0
+   ],
+   "project": "example",
+   "target": "finish:segment:seg_e5f6a7b8:take_a1b2c3d4",
+   "fps": 32,
+   "trim_start": 0,
+   "trim_end": 0,
+   "splice_source": "",
+   "splice_start": 0,
+   "meta": "{\"key\": \"{\\\"h\\\": 1080, \\\"i\\\": 2, \\\"im\\\": \\\"film_net_fp16.safetensors\\\", \\\"m\\\": \\\"refine\\\", \\\"r\\\": [1280, 720, 0.3, \\\"\\\", \\\"\\\", true, 1.0], \\\"u\\\": \\\"4x-UltraSharp.pth\\\", \\\"w\\\": 1920}\", \"multiplier\": 2, \"source\": \"clips/seg_e5f6a7b8/take_a1b2c3d4.mp4\", \"method\": \"refine\", \"upscale_model\": \"4x-UltraSharp.pth\", \"refine\": {\"model\": \"wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors\", \"width\": 1280, \"height\": 720, \"denoise\": 0.3, \"steps\": 4, \"windows\": 1, \"seed\": 72612382905590}}"
+  },
+  "_meta": {
+   "title": "DirectorSaveVideo"
+  }
+ }
+}

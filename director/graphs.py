@@ -507,12 +507,155 @@ def build_interpolate(cfg, proj, render_file, multiplier=2):
     return g.nodes
 
 
+# ---------------------------------------------------------------- finishing (upscale / refine / interpolate)
+#
+# Works on one take at a time, so memory stays bounded and a re-render costs nothing. The result is
+# stored as the take's `finished` version together with the settings key it was made with.
+#   resize : antialiased resize to the output size
+#   model  : upscale model (ESRGAN family) then resize to the output size
+#   refine : upscale to the refine size, a low-denoise pass of the Wan low-noise model (adds real,
+#            temporally consistent detail; long clips go in overlapping windows), colour-matched to
+#            its input, then upscaled to the output size
+# Interpolation (FILM/RIFE) runs last, at the output size.
+
+def _upscaler(g, fs):
+    if fs["method"] == "resize":
+        return None
+    name = fs.get("upscale_model")
+    if not name:
+        return None
+    files = M._list("upscale_models")
+    if files and name not in files:
+        raise ValueError(f"upscale model {name!r} is not in models/upscale_models – choose one in "
+                         f"Settings → Finishing, or use 'Resize only'")
+    return out(g.add("UpscaleModelLoader", _title="Upscale model", model_name=name))
+
+
+def _refine_model(g, cfg, fs, loras):
+    """Wan low-noise model for the refine pass (+ fast LoRA when fast video is on, + clip LoRAs)."""
+    w, r = cfg["wan"], fs["refine"]
+    fam = w["t2v"]
+    name = r.get("model") or fam.get("low") or fam["high"]
+    default_lora = fam.get("fast_lora_low") if fam.get("low") else fam.get("fast_lora_high")
+    fl = r.get("fast_lora") or default_lora
+    if fl == M.NONE:
+        fl = None
+    m = g.load.model(name, w.get("weight_dtype", "default"), "Wan refine (low noise)")
+    return m, fl, name
+
+
+def build_finish_segment(cfg, proj, seg_index, take_id=None, seed=None):
+    s = proj["settings"]
+    seg = proj["timeline"][seg_index]
+    take = next((t for t in seg.get("takes", []) if t["id"] == (take_id or seg.get("selected"))), None)
+    if take is None:
+        raise P.NotReady(f"clip '{seg.get('name') or seg['id']}' has no selected take")
+    fs = P.finish_settings(proj, cfg)
+    key = P.finish_key(fs, "video", s.get("fast_video", True))
+    pid = proj["id"]
+    W, H = fs["width"], fs["height"]
+    n = int(take.get("frames") or 0) or P.wan_length(seg.get("frames", 81))
+    seed = seed or rand_seed()
+    g = Graph()
+    up = _upscaler(g, fs)
+    info = {"method": fs["method"], "upscale_model": fs.get("upscale_model") if up else None}
+
+    if fs["method"] == "refine":
+        r = fs["refine"]
+        RW, RH = r["width"], r["height"]
+        fast = s.get("fast_video", True)
+        samp = r["fast"] if fast else r["quality"]
+        loras = merge_loras(s.get("video_loras"), seg.get("loras"))
+        model, fast_lora, model_name = _refine_model(g, cfg, fs, loras)
+        if fast and fast_lora:
+            model = apply_loras(g, model, [{"name": fast_lora, "strength": 1.0}])
+        model = apply_loras(g, model, loras, stage="low")
+        model = out(g.add("ModelSamplingSD3", model=model, shift=float(cfg["wan"].get("shift", 5.0))))
+        ck = _wan_ckpt(g, cfg, "t2v")
+        clip = g.load.clip(cfg["wan"]["text_encoder"], "wan", ckpt=ck)
+        vae = g.load.vae(cfg["wan"]["vae"], ckpt=ck)
+        prompt = take.get("prompt") or join_prompt(seg.get("prompt", ""), s.get("video_style_prompt", ""))
+        pos = out(g.add("CLIPTextEncode", _title="Prompt", clip=clip, text=prompt))
+        neg = out(g.add("CLIPTextEncode", _title="Negative", clip=clip, text=cfg["wan"].get("negative", "")))
+        win = max(17, int(r.get("window") or s.get("max_segment_frames") or 81))
+        ov = max(0, min(int(r.get("overlap", 8)), win // 4))
+        # fewest windows that keep at least `ov` frames of overlap, spread evenly over the clip
+        k = 1 if n <= win else -(-(n - ov) // (win - ov))
+        starts = [0] if k == 1 else [round(i * (n - win) / (k - 1)) for i in range(k)]
+        joined = None
+        for wi, a in enumerate(starts):
+            count = min(win, n - a)
+            tag = f" {wi + 1}/{len(starts)}" if len(starts) > 1 else ""
+            src = out(g.add("DirectorLoadVideoFrames", _title=f"Take frames{tag}", project=pid, path=take["file"],
+                            start=a, count=count, width=0, height=0), 0)
+            init = out(g.add("DirectorUpscaleFrames", _title=f"Upscale to refine size{tag}", images=src,
+                             width=RW, height=RH, batch=4, upscale_model=up))
+            padded = out(g.add("DirectorPadFrames", images=init, length=P.wan_length(count)), 0)
+            lat = out(g.add("VAEEncodeTiled", pixels=padded, vae=vae, tile_size=512, overlap=64,
+                            temporal_size=64, temporal_overlap=8))
+            smp = out(g.add("KSampler", _title=f"Refine{tag}", model=model, seed=seed, steps=int(samp["steps"]),
+                            cfg=float(samp["cfg"]), sampler_name=samp["sampler"], scheduler=samp["scheduler"],
+                            positive=pos, negative=neg, latent_image=lat, denoise=float(r["denoise"])))
+            dec = out(g.add("VAEDecodeTiled", samples=smp, vae=vae, tile_size=512, overlap=64,
+                            temporal_size=64, temporal_overlap=8))
+            dec = out(g.add("DirectorFrameRange", images=dec, start=0, count=count))
+            if float(r.get("color_match", 1.0)) > 0:
+                dec = out(g.add("DirectorColorMatch", _title="Colour match to the draft", images=dec, reference=init,
+                                strength=float(r.get("color_match", 1.0))))
+            joined = dec if joined is None else out(g.add("DirectorJoinFrames", a=joined, b=dec,
+                                                         overlap=starts[wi - 1] + win - a))
+        frames = joined
+        if (RW, RH) != (W, H):
+            # the model only earns its 4x intermediate when there is real enlarging left to do
+            # (refining at 1080p for a 1080p output only rounds 1072 -> 1080)
+            big = W * H > 1.2 * RW * RH
+            frames = out(g.add("DirectorUpscaleFrames", _title="Upscale to output size" if big else "Resize to output size",
+                               images=frames, width=W, height=H, batch=4, upscale_model=up if big else None))
+        info.update(refine={"model": model_name, "width": RW, "height": RH, "denoise": float(r["denoise"]),
+                            "steps": int(samp["steps"]), "windows": len(starts), "seed": seed})
+    else:
+        src = out(g.add("DirectorLoadVideoFrames", _title="Take frames", project=pid, path=take["file"], start=0,
+                        count=-1, width=0, height=0), 0)
+        frames = out(g.add("DirectorUpscaleFrames", _title="Upscale", images=src, width=W, height=H, batch=4,
+                           upscale_model=up))
+
+    m = fs["interpolate"]
+    if m > 1:
+        im = out(g.add("FrameInterpolationModelLoader", model_name=fs["interpolation_model"]))
+        frames = out(g.add("FrameInterpolate", interp_model=im, images=frames, multiplier=m))
+    g.add("DirectorSaveVideo", images=frames, project=pid, target=f"finish:segment:{seg['id']}:{take['id']}",
+          fps=fs["fps"], trim_start=0, trim_end=0, splice_source="", splice_start=0,
+          meta=meta_json(key=key, multiplier=m, source=take["file"], **info))
+    return g.nodes
+
+
+def build_finish_keyframe(cfg, proj, kid, take_id=None):
+    """Finished version of a keyframe that is held as a still (upscale model + resize)."""
+    kf = proj["keyframes"][kid]
+    take = next((t for t in kf.get("takes", []) if t["id"] == (take_id or kf.get("selected"))), None)
+    if take is None:
+        raise P.NotReady(f"keyframe '{kf.get('name') or kid}' has no selected take")
+    fs = P.finish_settings(proj, cfg)
+    g = Graph()
+    up = _upscaler(g, fs)
+    img = out(g.add("DirectorLoadImage", _title="Keyframe", project=proj["id"], path=take["file"], width=0, height=0,
+                    fit="none"))
+    img = out(g.add("DirectorUpscaleFrames", _title="Upscale", images=img, width=fs["width"], height=fs["height"],
+                    batch=1, upscale_model=up))
+    g.add("DirectorSaveImage", images=img, project=proj["id"], target=f"finish:keyframe:{kid}:{take['id']}",
+          meta=meta_json(key=P.finish_key(fs, "still"), method=fs["method"] if fs["method"] != "refine" else "model",
+                         upscale_model=fs.get("upscale_model") if up else None, source=take["file"]))
+    return g.nodes
+
+
 # ---------------------------------------------------------------- dispatcher
 
 def build(cfg, proj, req):
     """req: {action, id, count, ...} -> list of {prompt, target, seed}"""
     cfg = M.effective_config(cfg, proj["settings"])
     action = req["action"]
+    if action.startswith("finish."):
+        return build_finish(cfg, proj, req)
     count = max(1, min(8, int(req.get("count") or proj["settings"].get("takes_per_run", 1))))
     jobs = []
     for _ in range(count):
@@ -557,4 +700,29 @@ def build(cfg, proj, req):
         jobs.append({"prompt": g, "target": target, "seed": seed})
         if action == "render.interpolate":
             break
+    return jobs
+
+
+def build_finish(cfg, proj, req):
+    """finish.segment {id, take?}, finish.keyframe {id, take?}, or finish.all {redo?} (everything the
+    final render needs that is missing or outdated; stills first so models load once per kind)."""
+    action = req["action"]
+    if action == "finish.all":
+        states = ("missing", "outdated", "ok") if req.get("redo") else ("missing", "outdated")
+        items = [i for i in P.finish_items(proj, cfg) if i["state"] in states]
+        items.sort(key=lambda i: i["kind"] != "keyframe")
+    elif action in ("finish.segment", "finish.keyframe"):
+        items = [{"kind": action.split(".")[1], "id": req["id"], "take": req.get("take")}]
+    else:
+        raise ValueError(f"unknown action {action}")
+    jobs = []
+    for it in items:
+        if it["kind"] == "keyframe":
+            g = build_finish_keyframe(cfg, proj, it["id"], it.get("take"))
+        else:
+            i, _ = P.find_segment(proj, it["id"])
+            g = build_finish_segment(cfg, proj, i, it.get("take"))
+        tid = it.get("take") or (proj["keyframes"][it["id"]] if it["kind"] == "keyframe"
+                                 else P.find_segment(proj, it["id"])[1]).get("selected")
+        jobs.append({"prompt": g, "target": f"finish:{it['kind']}:{it['id']}:{tid}", "seed": None})
     return jobs

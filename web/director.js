@@ -44,7 +44,10 @@ const S = {
   viewTake: {},          // entity id -> take id shown in viewer
   pending: new Map(),    // prompt_id -> {target, label}
   progress: null, zoom: 3, autofill: false, lastRender: null,
+  finish: null,          // finishing status: {settings, items, count}
+  showFinished: true,    // viewer shows a take's finished (upscaled) version when it has one
 };
+const applyData = (d) => { S.project = d.project; S.status = d.status; if (d.finish) S.finish = d.finish; };
 
 const fileURL = (rel) => api.apiURL(`/director/file/${S.pid}/${rel}`);
 const kfById = (id) => S.project?.keyframes?.[id];
@@ -64,13 +67,13 @@ async function loadProject(pid) {
   if (!pid) { S.project = null; S.status = null; return; }
   try {
     const d = await J(`/director/project/${pid}`);
-    S.pid = pid; S.project = d.project; S.status = d.status;
+    S.pid = pid; applyData(d);
     localStorage.setItem("director.pid", pid);
   } catch (e) { S.pid = null; S.project = null; localStorage.removeItem("director.pid"); }
 }
 async function op(o) {
   const d = await J(`/director/project/${S.pid}/op`, { body: o });
-  S.project = d.project; S.status = d.status;
+  applyData(d);
   render();
   return d.result || {};
 }
@@ -119,6 +122,10 @@ function nodeWeight(n) {
   if (ENCODERS.has(c)) return 3;
   if (c === "CLIPTextEncode" || c.startsWith("TextEncodeQwen")) return 2;
   if (c === "VAEDecode") return 5;
+  if (c === "VAEDecodeTiled") return 8;
+  if (c === "VAEEncodeTiled") return 4;
+  if (c === "DirectorUpscaleFrames") return i.upscale_model ? 15 : 2;
+  if (c === "UpscaleModelLoader" || c === "FrameInterpolationModelLoader") return 1;
   if (c === "DirectorSaveVideo") return 3;
   if (c === "FrameInterpolate") return 25;
   if (c === "VAELoader" || c === "LoraLoaderModelOnly" || c === "DirectorLoadVideoFrames" || c === "DirectorSaveImage") return 1;
@@ -133,12 +140,17 @@ function stageName(n) {
   if (c === "VAELoader") return "Loading VAE";
   if (c === "LoraLoaderModelOnly") return "Applying LoRA";
   if (c === "CLIPTextEncode" || c.startsWith("TextEncodeQwen")) return "Encoding prompt";
-  if (ENCODERS.has(c)) return "Encoding frames";
-  if (c === "VAEDecode") return "Decoding";
+  if (ENCODERS.has(c) || c === "VAEEncodeTiled") return "Encoding frames";
+  if (c === "VAEDecode" || c === "VAEDecodeTiled") return "Decoding";
+  if (c === "DirectorUpscaleFrames") return t ? t : "Upscaling";
+  if (c === "UpscaleModelLoader") return "Loading upscale model";
+  if (c === "FrameInterpolationModelLoader") return "Loading interpolation model";
+  if (c === "DirectorJoinFrames") return "Joining refine windows";
+  if (c === "DirectorPadFrames" || c === "DirectorFrameRange") return "Preparing frames";
   if (c === "DirectorColorMatch") return "Colour matching";
   if (c === "DirectorVaceBridge" || c === "DirectorVaceInpaint" || c === "DirectorMaskCrop") return "Preparing frames";
   if (c === "DirectorMaskStitch" || c === "DirectorCompositeFrames") return "Blending result";
-  if (c.startsWith("DirectorSave")) return "Saving take";
+  if (c.startsWith("DirectorSave")) return n.inputs?.target?.startsWith("finish:") ? "Saving finished version" : "Saving take";
   if (c === "FrameInterpolate") return "Interpolating";
   if (c.startsWith("DirectorLoad")) return "Loading inputs";
   return t || c;
@@ -274,6 +286,7 @@ function render() {
   S.root.replaceChildren(...newKids);
   const tr = S.root.querySelector(".dr-track"); if (tr) tr.scrollLeft = scroll;
   updateProgressUI();
+  S.finishRedraw?.();
 }
 
 // ------------------------------------------------------------------ header
@@ -290,7 +303,9 @@ function renderHeader() {
     n ? h("span", { class: "dr-q" }, h("span", { class: "dr-spin" }), h("span", { class: "lb" }, ""), h("span", { class: "bar" }, h("i"))) : null,
     S.project && h("button", { class: S.autofill ? "warn" : "", title: "Generate every keyframe and clip whose inputs are ready, then continue down the timeline as results arrive",
       onclick: () => { S.autofill = !S.autofill; render(); if (S.autofill) autoFillStep(); } }, S.autofill ? "■ Stop auto-fill" : "⚡ Auto-fill gaps"),
-    S.project && h("button", { class: "pri", onclick: doRender }, "▶ Render timeline"),
+    S.project && h("button", { title: "Render the selected takes at the project size, as generated", onclick: () => doRender(false) }, "▶ Render draft"),
+    S.project && h("button", { class: "pri", title: "Upscale the selected takes to the delivery size and render the final video", onclick: () => finishDialog() },
+      `✨ Final ${finishLabel()}…`),
     h("button", { onclick: closePanel, title: "Close (Esc)" }, "✕"));
 }
 async function newProject() {
@@ -298,17 +313,20 @@ async function newProject() {
   if (!name) return;
   const d = await J("/director/projects", { body: { name } });
   S.projects = (await J("/director/projects")).projects;
-  S.pid = d.project.id; S.project = d.project; S.status = d.status; S.sel = null;
+  S.pid = d.project.id; applyData(d); S.sel = null;
   localStorage.setItem("director.pid", S.pid);
   render();
 }
-async function doRender() {
-  toast("Rendering…");
+async function doRender(final = false) {
+  toast(final ? "Rendering final video…" : "Rendering…");
   try {
-    const r = await J(`/director/project/${S.pid}/render`, { body: {} });
+    const r = await J(`/director/project/${S.pid}/render`, { body: { final } });
     S.lastRender = r; S.sel = { type: "render" };
     render();
-    if (r.skipped?.length) toast(`Rendered ${r.seconds.toFixed(1)}s; ${r.skipped.length} segment(s) skipped (no take yet)`);
+    const notes = [];
+    if (r.skipped?.length) notes.push(`${r.skipped.length} clip(s) skipped (no take yet)`);
+    if (r.fallbacks?.length) notes.push(`${r.fallbacks.length} clip(s) not finished – resized instead`);
+    if (notes.length) toast(`Rendered ${r.seconds.toFixed(1)}s; ${notes.join("; ")}`);
   } catch (e) { toast(e.message, true); }
 }
 
@@ -347,7 +365,7 @@ async function upload(file, purpose, extra = {}) {
   try {
     toast(`Importing ${file.name}…`);
     const d = await J(`/director/project/${S.pid}/upload`, { form: fd });
-    S.project = d.project; S.status = d.status;
+    applyData(d);
     if (d.result.keyframe) S.sel = { type: "keyframe", id: d.result.keyframe };
     if (d.result.segment) S.sel = { type: "segment", id: d.result.segment };
     render();
@@ -374,10 +392,13 @@ function renderViewer() {
   if (sel?.type === "render" && S.lastRender) {
     const r = S.lastRender;
     box.append(h("div", { class: "dr-stage" }, h("video", { src: fileURL(r.file), controls: true, autoplay: true, loop: true }),
-      h("div", { class: "cap" }, `Render · ${r.seconds.toFixed(1)}s · ${r.frames} frames`)),
-      h("div", { class: "dr-takebar" }, h("span", { class: "info" }, r.skipped?.length ? `${r.skipped.length} segment(s) without a take were skipped` : "All segments included"),
+      h("div", { class: "cap" }, `${r.final ? "Final" : "Draft"} render · ${r.width}×${r.height} @ ${r.fps} fps · ${r.seconds.toFixed(1)}s · ${r.frames} frames`)),
+      h("div", { class: "dr-takebar" }, h("span", { class: "info" }, [
+          r.skipped?.length ? `${r.skipped.length} clip(s) without a take were skipped` : "All clips included",
+          r.fallbacks?.length ? ` · ${r.fallbacks.length} clip(s) were not finished and were resized instead` : ""].join("")),
         h("a", { href: fileURL(r.file), download: "" }, h("button", {}, "Download mp4")),
-        h("button", { title: "FILM frame interpolation ×2 (needs the frame_interpolation model)",
+        r.final ? h("button", { onclick: () => finishDialog() }, "Finishing…") :
+        h("button", { title: "FILM frame interpolation ×2 of this draft render. For the final video, set interpolation in ✨ Final instead (it runs per clip).",
           onclick: () => generate({ action: "render.interpolate", file: r.file, multiplier: 2 }, "interpolate ×2") }, "Interpolate ×2")));
     return box;
   }
@@ -400,11 +421,14 @@ function renderViewer() {
     const kf = kfById(ent.keyframe);
     stage.append(kf && kfThumb(kf) ? h("img", { src: kfThumb(kf) }) : h("div", { class: "empty" }, "Choose a keyframe for this still"));
   } else if (take) {
+    const fin = S.showFinished && take.finished ? take.finished : null;
+    const fstate = finishState(sel.type, take);
     if (isSeg) {
-      const v = h("video", { src: fileURL(take.file), controls: true, loop: true, autoplay: true, muted: true, id: "dr-video" });
+      const v = h("video", { src: fileURL(fin ? fin.file : take.file), controls: true, loop: true, autoplay: true, muted: true, id: "dr-video" });
       stage.append(v);
-    } else stage.append(h("img", { src: fileURL(take.file), id: "dr-image" }));
-    stage.append(h("div", { class: "cap" }, `${ent.name || ent.id} · take ${ent.takes.indexOf(take) + 1}/${ent.takes.length}` + (take.id === ent.selected ? " ★" : "") + (take.mode ? ` · ${take.mode}` : "") + (take.op ? ` · ${take.op}` : "")));
+    } else stage.append(h("img", { src: fileURL(fin ? fin.file : take.file), id: "dr-image" }));
+    stage.append(h("div", { class: "cap" }, `${ent.name || ent.id} · take ${ent.takes.indexOf(take) + 1}/${ent.takes.length}` + (take.id === ent.selected ? " ★" : "") + (take.mode ? ` · ${take.mode}` : "") + (take.op ? ` · ${take.op}` : "")
+      + (fin ? ` · finished ${fin.width}×${fin.height}${fstate === "outdated" ? " (outdated)" : ""}` : take.finished ? " · draft" : "")));
   } else {
     const st = isSeg ? S.status.segments[ent.id] : S.status.keyframes[ent.id];
     stage.append(h("div", { class: "empty" }, pendingFor(`${sel.type}:${ent.id}`) ? [h("span", { class: "dr-spin" }), " generating…"] :
@@ -427,6 +451,9 @@ function renderViewer() {
         h("span", { class: "info" }, take.prompt ? `“${take.prompt.slice(0, 110)}${take.prompt.length > 110 ? "…" : ""}”` : ""),
         take.id !== ent.selected ? h("button", { class: "pri", onclick: () => op({ op: `${sel.type}.select`, id: ent.id, take: take.id }) }, "★ Use this take") : null,
         isSeg ? h("button", { title: "Save the current video frame as a new keyframe", onclick: () => grabFrame(ent, take) }, "📷 Frame → keyframe") : null,
+        take.finished ? h("button", { title: "Switch between the generated take and its finished (upscaled) version",
+          onclick: () => { S.showFinished = !S.showFinished; render(); } }, S.showFinished ? "Show draft" : "Show finished") : null,
+        isSeg || stillKeyframes().has(ent.id) ? finishButton(sel.type, ent, take) : null,
         h("button", { onclick: () => (isSeg ? videoInpaintDialog(ent, take) : imageInpaintDialog(ent, take)) }, "🖌 Inpaint region…"),
         !isSeg ? h("button", { onclick: () => newKeyframe("edit", [ent.id]) }, "↳ Derive new keyframe") : null,
         h("button", { class: "warn", onclick: () => confirm("Delete this take?") && op({ op: `${sel.type}.delete_take`, id: ent.id, take: take.id }) }, "Delete take")));
@@ -439,7 +466,7 @@ async function grabFrame(seg, take) {
   const frame = v ? Math.round(v.currentTime * S.project.settings.fps) : 0;
   try {
     const d = await J(`/director/project/${S.pid}/grab`, { body: { segment: seg.id, take: take.id, frame } });
-    S.project = d.project; S.status = d.status;
+    applyData(d);
     S.sel = { type: "keyframe", id: d.result.keyframe };
     render(); toast(`Frame ${frame} saved as keyframe`);
   } catch (e) { toast(e.message, true); }
@@ -745,7 +772,7 @@ function renderTimeline() {
         if (seg.kind !== "generate") return toast("Keyframes anchor generated clips", true);
         const r = el.getBoundingClientRect(); const which = e.clientX - r.left < r.width / 2 ? "start" : "end";
         op({ op: "segment.update", id: seg.id, fields: { [which]: { type: "keyframe", keyframe: kid } } }); },
-    }, film, ...anchors,
+    }, film, ...anchors, finishBadge(seg),
       h("div", { class: "lbl" }, h("span", { class: "dr-dot " + segStateDot(seg) }),
         seg.kind === "generate" && S.status.segments[seg.id]?.mode ? h("span", { class: "dr-badge " + (take?.mode || S.status.segments[seg.id].mode) }, take?.mode || S.status.segments[seg.id].mode) : h("span", { class: "dr-badge" }, seg.kind),
         h("b", {}, seg.name || `#${i + 1}`), h("span", { class: "dur" }, fmtSec(frames, s.fps)),
@@ -820,13 +847,19 @@ async function settingsDialog(tab = "general") {
       h("div", { class: "dr-help" }, "Qwen Image 2.1 receives these as extra reference images in every text→image, edit and inpaint run, which keeps characters and places consistent without training a LoRA.")] : null,
     h("label", {}, "Project-wide video LoRAs"), loraEditor(s.video_loras, (l) => { s.video_loras = l; }, true));
   const models = md ? modelsPanel(s, md) : h("div", { class: "dr-help" }, "Could not load the model list.");
-  const panes = { general, models };
-  const tabs = h("div", { class: "dr-tabs" }, [["general", "General"], ["models", "Models"]].map(([k, t]) =>
+  s.finish = { ...(s.finish || {}) };
+  const finishing = h("div", {});
+  const drawFinishing = () => finishing.replaceChildren(
+    h("div", { class: "dr-help", style: { marginTop: "10px" } }, "How the selected takes are upscaled for the final video (✨ Final in the header). Defaults come from config.json."),
+    finishSettingsForm(s.finish, md, drawFinishing));
+  drawFinishing();
+  const panes = { general, models, finishing };
+  const tabs = h("div", { class: "dr-tabs" }, [["general", "General"], ["models", "Models"], ["finishing", "Finishing"]].map(([k, t]) =>
     h("button", { class: k === tab ? "on" : "", onclick: (e) => { for (const b of tabs.children) b.classList.remove("on"); e.target.classList.add("on");
       for (const [pk, pv] of Object.entries(panes)) pv.style.display = pk === k ? "" : "none"; } }, t)));
   for (const [pk, pv] of Object.entries(panes)) pv.style.display = pk === tab ? "" : "none";
   const body = h("div", { style: { width: "680px" } },
-    h("h2", {}, "Project settings"), tabs, general, models,
+    h("h2", {}, "Project settings"), tabs, general, models, finishing,
     h("div", { class: "dr-actions" }, h("span", { style: { flex: 1 } }),
       h("button", { onclick: () => m.remove() }, "Cancel"),
       h("button", { class: "pri", onclick: async () => { m.remove(); await op({ op: "settings.update", fields: s }); } }, "Save")));
@@ -905,6 +938,160 @@ function modelsPanel(s, md) {
     h("div", { class: "dr-help", style: { marginTop: "10px" } }, "Defaults come from config.json. Pick another file here to use it for this project only: a different precision or quantisation, a fine-tune, an all-in-one checkpoint (its text encoder and VAE can then be set to “From checkpoint”), or a GGUF file" + (files.gguf_installed ? "." : " (needs the ComfyUI-GGUF custom nodes, not detected).")),
     h("label", {}, "Keyframe model family"), family, groupsBox);
   return wrap;
+}
+
+// ------------------------------------------------------------------ finishing (upscale / refine / interpolate)
+const stillKeyframes = () => new Set((S.project?.timeline || []).filter((x) => x.kind === "still" && x.keyframe).map((x) => x.keyframe));
+function finishState(kind, take) {
+  if (!take?.finished) return "missing";
+  const key = kind === "segment" ? S.finish?.video_key : S.finish?.still_key;
+  return take.finished.key === key ? "ok" : "outdated";
+}
+const finishLabel = () => { const f = S.finish?.settings; return f ? `${Math.min(f.width, f.height)}p` : "1080p"; };
+const finishTarget = (kind, id, take) => `finish:${kind}:${id}:${take}`;
+function finishButton(kind, ent, take) {
+  const pend = pendingFor(finishTarget(kind, ent.id, take.id));
+  const st = finishState(kind, take);
+  return h("button", { disabled: !!pend, title: "Upscale this take to the delivery size with the finishing settings (✨ Final)",
+    onclick: () => generate({ action: `finish.${kind}`, id: ent.id, take: take.id }, `finish ${ent.name || ent.id}`) },
+    pend ? "Finishing…" : st === "ok" ? "✨ Finish again" : st === "outdated" ? "✨ Update finish" : `✨ Finish ${finishLabel()}`);
+}
+function finishBadge(seg) {
+  const kind = seg.kind === "still" ? "keyframe" : "segment";
+  const ent = kind === "keyframe" ? kfById(seg.keyframe) : seg;
+  const t = ent && takeOf(ent);
+  if (!t) return null;
+  if (pendingFor(finishTarget(kind, ent.id, t.id))) return h("span", { class: "dr-badge fin", title: "finishing" }, h("span", { class: "dr-spin" }));
+  const st = finishState(kind, t);
+  if (st === "missing") return null;
+  return h("span", { class: "dr-badge fin" + (st === "ok" ? "" : " old"), title: st === "ok" ? `finished ${t.finished.width}×${t.finished.height}` : "finished with other settings – update it in ✨ Final" }, "HD");
+}
+
+// output size with the project's aspect ratio (mirrors project.size_for_short_side)
+function sizeForShort(short) {
+  const s = S.project.settings, ar = s.width / s.height, even = (x) => Math.max(2, Math.round(x / 2) * 2);
+  if (Math.abs(ar - 16 / 9) / (16 / 9) < 0.03) return [even((short * 16) / 9), short];
+  if (Math.abs(ar - 9 / 16) / (9 / 16) < 0.03) return [short, even((short * 16) / 9)];
+  return ar >= 1 ? [even(short * ar), short] : [short, even(short / ar)];
+}
+// effective finishing settings for an override object (defaults from config via /director/models)
+function effFinish(o, md) {
+  const D = md?.finish_defaults || S.finish?.settings || {};
+  const pick = (v, d) => (v === undefined || v === null || v === "" ? d : v);
+  const r = { ...(D.refine || {}) };
+  for (const [k, v] of Object.entries(o.refine || {})) if (v !== "" && v !== null && v !== undefined) r[k] = v;
+  const e = { method: pick(o.method, D.method), upscale_model: pick(o.upscale_model, D.upscale_model), interpolate: +pick(o.interpolate, D.interpolate || 1),
+    interpolation_model: pick(o.interpolation_model, D.interpolation_model), short_side: +pick(o.short_side, D.short_side || 1080), refine: r };
+  [e.width, e.height] = o.width && o.height ? [o.width, o.height] : sizeForShort(e.short_side);
+  return e;
+}
+const METHOD_HELP = {
+  resize: "Resizes the frames only. Fast, but adds no detail.",
+  model: "Runs an upscale model (ESRGAN family, e.g. 4x-UltraSharp) on every frame, then resizes to the output size. Sharp and quick (seconds per clip); fine texture can shimmer a little because each frame is upscaled on its own.",
+  refine: "Upscales to the refine size, then runs a short low-denoise pass of the Wan low-noise model with the clip’s prompt and LoRAs. This adds real detail that stays consistent over time, and the colour is matched back to the draft. The upscale model then takes it to the output size. Costs about one fast generation per clip at the refine size.",
+};
+function finishSettingsForm(o, md, onChange) {
+  const e = effFinish(o, md);
+  const files = md?.files || {};
+  const set = (patch) => { Object.assign(o, patch); for (const k of Object.keys(o)) if (o[k] === "" || o[k] === undefined) delete o[k]; onChange(); };
+  const setR = (patch) => { o.refine = { ...(o.refine || {}), ...patch }; for (const k of Object.keys(o.refine)) if (o.refine[k] === "" || o.refine[k] === undefined) delete o.refine[k]; if (!Object.keys(o.refine).length) delete o.refine; onChange(); };
+  const D = md?.finish_defaults || {};
+  const fileSel = (list, cur, dflt, onSel, extra = []) => {
+    const has = (v) => list.some((f) => f.value === v);
+    return h("select", { onchange: (ev) => onSel(ev.target.value) },
+      h("option", { value: "" }, dflt ? `Default (${dflt}${has(dflt) || !/\.\w+$/.test(dflt) ? "" : " – not found"})` : "Default"),
+      extra.map(([v, t]) => h("option", { value: v, selected: cur === v }, t)),
+      list.map((f) => h("option", { value: f.value, selected: cur === f.value }, f.value)),
+      cur && !extra.some(([v]) => v === cur) && !has(cur) ? h("option", { value: cur, selected: true }, `${cur} – not found`) : null);
+  };
+  const custom = !!(o.width && o.height);
+  const sizeSel = h("select", { onchange: (ev) => { const v = ev.target.value;
+      if (v === "custom") { const [w, hh] = sizeForShort(e.short_side); set({ width: w, height: hh, short_side: undefined }); }
+      else set({ short_side: +v, width: undefined, height: undefined }); } },
+    [720, 1080, 1440, 2160].map((v) => { const [w, hh] = sizeForShort(v); return h("option", { value: v, selected: !custom && e.short_side === v }, `${v}p – ${w} × ${hh}`); }),
+    h("option", { value: "custom", selected: custom }, "Custom size…"));
+  const fps = S.project.settings.fps;
+  const upList = files.upscale || [];
+  const els = [
+    h("div", { class: "dr-grid2" },
+      h("div", {}, h("label", {}, "Output size"), sizeSel),
+      h("div", {}, h("label", {}, "Frame rate"), h("select", { onchange: (ev) => set({ interpolate: +ev.target.value }) },
+        [1, 2, 3, 4].map((k) => h("option", { value: k, selected: e.interpolate === k }, k === 1 ? `${fps} fps (no interpolation)` : `${fps * k} fps (interpolate ×${k})`))))),
+    custom ? h("div", { class: "dr-grid2" },
+      h("div", {}, h("label", {}, "Width"), h("input", { type: "number", step: 2, value: o.width, onchange: (ev) => set({ width: parseInt(ev.target.value, 10) }) })),
+      h("div", {}, h("label", {}, "Height"), h("input", { type: "number", step: 2, value: o.height, onchange: (ev) => set({ height: parseInt(ev.target.value, 10) }) }))) : null,
+    h("div", { class: "dr-help" }, `Clips are generated at ${S.project.settings.width} × ${S.project.settings.height}` +
+      (Math.abs(e.width / e.height - S.project.settings.width / S.project.settings.height) > 0.005 ? "; the output aspect ratio differs slightly, so a thin strip is cropped from the edges." : ".")),
+    h("label", {}, "Method"),
+    h("select", { onchange: (ev) => set({ method: ev.target.value }) },
+      [["resize", "Resize only"], ["model", "Upscale model"], ["refine", "Wan refine + upscale model (best)"]].map(([v, t]) => h("option", { value: v, selected: e.method === v }, t))),
+    h("div", { class: "dr-help" }, METHOD_HELP[e.method]),
+  ];
+  if (e.method !== "resize") {
+    els.push(h("label", {}, "Upscale model (models/upscale_models)"),
+      fileSel(upList, o.upscale_model || "", D.upscale_model, (v) => set({ upscale_model: v })),
+      !upList.length ? h("div", { class: "dr-help", style: { color: "#ff9a8a" } }, "No upscale models found. Put one (e.g. 4x-UltraSharp.pth, RealESRGAN_x4plus.pth or 4x_NMKD-Siax_200k.pth) in ComfyUI/models/upscale_models and restart, or the frames are only resized.") : null);
+  }
+  if (e.method === "refine") {
+    const r = e.refine;
+    els.push(h("div", { class: "dr-grid2" },
+      h("div", {}, h("label", {}, "Refine at"), h("select", { onchange: (ev) => setR({ short_side: +ev.target.value }) },
+        [480, 720, 1080].filter((v) => v <= Math.min(e.width, e.height)).map((v) => { const [w, hh] = sizeForShort(v); return h("option", { value: v, selected: +r.short_side === v }, `${v}p – ${w} × ${hh}`); }))),
+      h("div", {}, h("label", {}, "Denoise"), h("input", { type: "number", step: 0.05, min: 0.05, max: 0.7, value: r.denoise, onchange: (ev) => setR({ denoise: parseFloat(ev.target.value) }) }))),
+      h("div", { class: "dr-help" }, `Denoise 0.2–0.35 adds detail without changing the shot; higher starts repainting it. ${S.project.settings.fast_video ? `Fast video is on: ${r.fast?.steps ?? 4} steps with the lightx2v LoRA.` : `Fast video is off: ${r.quality?.steps ?? 10} steps at CFG ${r.quality?.cfg ?? 3.5}.`} Refining at 1080p takes roughly 2–3× as long as at 720p.`),
+      h("div", { class: "dr-grid2" },
+        h("div", {}, h("label", {}, "Refine model"), fileSel(files.diffusion || [], o.refine?.model || "", "Wan t2v low noise", (v) => setR({ model: v }))),
+        h("div", {}, h("label", {}, "Fast LoRA"), fileSel(files.lora || [], o.refine?.fast_lora || "", "its fast LoRA", (v) => setR({ fast_lora: v }), [["@none", "None"]]))),
+      h("div", { class: "dr-grid2" },
+        h("div", {}, h("label", {}, "Colour match to draft (0–1)"), h("input", { type: "number", step: 0.1, min: 0, max: 1, value: r.color_match, onchange: (ev) => setR({ color_match: parseFloat(ev.target.value) }) })),
+        h("div", {})));
+  }
+  if (e.interpolate > 1) {
+    els.push(h("label", {}, "Interpolation model (models/frame_interpolation)"),
+      fileSel(files.interpolation || [], o.interpolation_model || "", D.interpolation_model, (v) => set({ interpolation_model: v })));
+  }
+  return h("div", {}, els);
+}
+
+async function finishDialog() {
+  const md = await J("/director/models").catch((e) => { toast(e.message, true); return null; });
+  const o = JSON.parse(JSON.stringify(S.project.settings.finish || {}));
+  const body = h("div", { style: { width: "760px" } });
+  let m;
+  const STATE = { ok: ["up to date", "ok"], outdated: ["outdated", "old"], missing: ["not finished", "todo"], no_take: ["no take yet", "none"] };
+  const save = async () => { await op({ op: "settings.update", fields: { finish: o } }); };
+  const draw = () => {
+    if (!document.body.contains(m)) { S.finishRedraw = null; return; }
+    const F = S.finish, f = F.settings, c = F.count;
+    const todo = c.missing + c.outdated;
+    const items = F.items;
+    const pending = items.filter((it) => it.take && pendingFor(finishTarget(it.kind, it.id, it.take))).length;
+    body.replaceChildren(
+      h("h2", {}, `Final video · ${f.width} × ${f.height} @ ${f.fps} fps`),
+      h("div", { class: "dr-help" }, "Each clip’s selected take is finished on its own and the result is kept with the take, so re-rendering is instant and changing one clip only re-finishes that clip. Changing these settings marks existing finished versions as outdated."),
+      h("div", { class: "dr-fin" },
+        h("div", {}, finishSettingsForm(o, md, save)),
+        h("div", {},
+          h("label", {}, `Timeline (${c.ok}/${items.length - c.no_take} finished)`),
+          items.length ? h("div", { class: "dr-finlist" }, items.map((it) => {
+            const pend = it.take && pendingFor(finishTarget(it.kind, it.id, it.take));
+            const [lbl, cls] = STATE[it.state];
+            return h("div", { class: "row" },
+              h("span", { class: "nm", title: it.name }, it.kind === "keyframe" ? "▣ " : "", it.name),
+              pend ? h("span", { class: "dr-chip run" }, h("span", { class: "dr-spin" }), " finishing") : h("span", { class: `dr-chip ${cls}` }, lbl),
+              it.take ? h("button", { disabled: !!pend, title: it.state === "ok" ? "Finish again" : "Finish this one",
+                onclick: () => generate({ action: `finish.${it.kind}`, id: it.id, take: it.take }, `finish ${it.name}`).then(draw) }, it.state === "ok" ? "↻" : "✨") : h("span"));
+          })) : h("div", { class: "dr-help" }, f.method === "resize" && f.interpolate === 1 ? "Resize only: the final render resizes on the fly, so there is nothing to finish." : "The timeline is empty."),
+          c.no_take ? h("div", { class: "dr-help" }, `${c.no_take} clip(s) have no selected take and will be skipped.`) : null)),
+      h("div", { class: "dr-actions" },
+        h("span", { class: "dr-help", style: { flex: 1, margin: 0 } }, pending ? `${pending} finishing job(s) running…` : todo ? `${todo} to finish. Clips that aren’t finished are resized in the render.` : "Everything is finished."),
+        h("button", { onclick: () => { m.remove(); S.finishRedraw = null; } }, "Close"),
+        h("button", { disabled: !todo || pending >= todo, onclick: () => generate({ action: "finish.all" }, "finish").then(draw) }, `✨ Finish ${todo || ""}`.trim()),
+        h("button", { class: "pri", onclick: () => { m.remove(); S.finishRedraw = null; doRender(true); } }, "▶ Render final")));
+  };
+  m = modal(body, () => { S.finishRedraw = null; });
+  S.finishRedraw = draw;
+  draw();
 }
 
 // Mask painter shared by image and video inpainting
@@ -1014,7 +1201,14 @@ function videoInpaintDialog(seg, take) {
   // capture current frame from the video element (same origin)
   const c = h("canvas");
   let src = fileURL(take.first);
-  if (v && v.videoWidth) { c.width = v.videoWidth; c.height = v.videoHeight; c.getContext("2d").drawImage(v, 0, 0); src = c.toDataURL("image/png"); }
+  if (v && v.videoWidth) {
+    // paint on the draft's pixel grid; a finished version on screen is a centre crop of it, so map it back
+    const dw = take.width || S.project.settings.width, dh = take.height || S.project.settings.height;
+    const sc = Math.max(v.videoWidth / dw, v.videoHeight / dh), rw = v.videoWidth / sc, rh = v.videoHeight / sc;
+    c.width = dw; c.height = dh;
+    c.getContext("2d").drawImage(v, (dw - rw) / 2, (dh - rh) / 2, rw, rh);
+    src = c.toDataURL("image/png");
+  }
   const n = take.frames || 81;
   const a = h("input", { type: "number", min: 0, max: n - 1, value: 0 });
   const b = h("input", { type: "number", min: 0, max: n - 1, value: n - 1 });
